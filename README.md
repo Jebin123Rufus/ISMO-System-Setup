@@ -1,1938 +1,1719 @@
 # Production Server Architecture & Deployment Plan
 
+> **Scope:** Single physical server — Application + Database co-located on one machine.
+> **Goal:** Secure, observable, recoverable, and efficient production deployment.
+
+---
+
+## Table of Contents
+
+1. [Objective](#1-objective)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Network Architecture](#3-network-architecture)
+4. [Hardware Specification](#4-hardware-specification)
+5. [Storage — RAID 10](#5-storage--raid-10)
+6. [Power — UPS](#6-power--ups)
+7. [Operating System](#7-operating-system)
+8. [Ubuntu Installation](#8-ubuntu-installation)
+9. [Initial System Configuration](#9-initial-system-configuration)
+10. [User & Privilege Model](#10-user--privilege-model)
+11. [SSH Hardening](#11-ssh-hardening)
+12. [Host Firewall (UFW)](#12-host-firewall-ufw)
+13. [Public IP & DNS](#13-public-ip--dns)
+14. [NAT / Port Forwarding](#14-nat--port-forwarding)
+15. [Nginx — Reverse Proxy & TLS](#15-nginx--reverse-proxy--tls)
+16. [Application Deployment](#16-application-deployment)
+17. [Process Management (systemd)](#17-process-management-systemd)
+18. [Database — Co-located Setup](#18-database--co-located-setup)
+19. [Database Security](#19-database-security)
+20. [Secrets Management](#20-secrets-management)
+21. [Internal Service Communication](#21-internal-service-communication)
+22. [Employee Network & VLAN](#22-employee-network--vlan)
+23. [Remote Access — WireGuard VPN](#23-remote-access--wireguard-vpn)
+24. [Security Headers & Rate Limiting](#24-security-headers--rate-limiting)
+25. [Host Security Hardening](#25-host-security-hardening)
+26. [Monitoring & Alerting](#26-monitoring--alerting)
+27. [Centralized Logging](#27-centralized-logging)
+28. [Backup Strategy](#28-backup-strategy)
+29. [Disaster Recovery](#29-disaster-recovery)
+30. [Deployment Order](#30-deployment-order)
+31. [Pre-Production Checklist](#31-pre-production-checklist)
+
+---
+
 ## 1. Objective
 
-Deploy a physical company server that:
+Deploy a single physical server that:
 
-* Runs 24/7.
-* Hosts the production application.
-* Hosts the production database.
-* Is reachable by customers over the Internet.
-* Allows employees to access authorized internal resources.
-* Allows authorized remote employees to access internal resources through VPN.
-* Provides secure administrative access through SSH.
-* Uses RAID 10 for storage redundancy.
-* Maintains separate backups.
-* Provides monitoring, logging, and security controls.
+| Requirement | Solution |
+|---|---|
+| Runs 24/7 | UPS + systemd auto-restart + monitored uptime |
+| Hosts the production application | Node.js / Spring Boot via systemd |
+| Hosts the production database (same machine) | PostgreSQL / MongoDB on `127.0.0.1` only |
+| Reachable by customers over the Internet | Nginx HTTPS reverse proxy |
+| Employee internal access | Firewall-controlled Employee VLAN |
+| Authorized remote access | WireGuard VPN |
+| Secure admin access | SSH over VPN only, key-based auth |
+| Storage redundancy | RAID 10 across 4 drives |
+| Data protection | Encrypted daily backups to off-site storage |
+| Observability | Prometheus + Grafana + Loki |
+
+> **Key constraint:** Application and database share one physical machine.
+> Isolation is achieved through OS-level controls — users, filesystem permissions,
+> firewall rules, and loopback binding — not network topology.
 
 ---
 
-# 2. High-Level Architecture
+## 2. Architecture Overview
 
-```text
-                              INTERNET
-                                  |
-                                  |
-                           Public IP Address
-                                  |
-                                  v
-                    +--------------------------+
-                    |   EDGE FIREWALL/ROUTER   |
-                    |                          |
-                    | NAT                      |
-                    | Firewall                 |
-                    | VPN Gateway              |
-                    | Routing                  |
-                    +------------+-------------+
-                                 |
-                    +------------+-------------+
-                    |                          |
-                    v                          v
-             PUBLIC WEB TRAFFIC           COMPANY LAN/VPN
-                    |                          |
-                    v                          |
-              +-----------+                    |
-              |   NGINX   |<-------------------+
-              | Reverse   |
-              | Proxy     |
-              +-----+-----+
-                    |
-                    v
-          +----------------------+
-          |   APPLICATION        |
-          | Node.js / Spring     |
-          +----------+-----------+
-                     |
-                     | Private DB connection
+```
+                          INTERNET
+                              |
+                         Public IP
+                              |
+                              v
+                +---------------------------+
+                |      EDGE FIREWALL        |
+                |  (pfSense / OPNsense)     |
+                |  NAT: 443, 80, 51820 only |
+                |  VLAN routing             |
+                |  WireGuard VPN endpoint   |
+                +----------+----------------+
+                           |
+       +-------------------+--------------------+
+       |                   |                    |
+       v                   v                    v
+ Public (443/80)     Employee VLAN        WireGuard VPN
+                     192.168.10.0/24      10.20.0.0/24
+                           |                    |
+                     +-----+--------------------+
+                     |   Internal access to server
                      v
-          +----------------------+
-          |      DATABASE        |
-          | MongoDB / PostgreSQL |
-          +----------+-----------+
-                     |
-                     v
-                  RAID 10
-                     |
-              +------+------+
-              |             |
-            Disk          Disk
-              |             |
-              +------+------+
-                     |
-                     v
-             SEPARATE BACKUPS
-                     |
-                     v
-               OFF-SITE COPY
+       +--------------------------------------------+
+       |       SERVER VLAN - 192.168.20.0/24        |
+       |                                            |
+       |  Ubuntu Server 24.04 LTS                  |
+       |                                            |
+       |  [ Nginx         :443 / :80          ]    |
+       |           |                               |
+       |  [ Application   127.0.0.1:3000      ]    |
+       |           |                               |
+       |  [ Database      127.0.0.1:5432      ]    |
+       |           |                               |
+       |  UFW / AppArmor / Fail2ban / auditd       |
+       |  Prometheus Node Exporter (127.0.0.1)     |
+       |  Promtail (log shipper -> off-server)     |
+       +--------------------+-----------------------+
+                            |
+                         RAID 10
+                            |
+                 +----------+----------+
+                 |                     |
+             Production           Local backup
+                Data             -> Off-site (S3)
+```
+
+### Traffic Boundaries
+
+| Source | Destination | Allowed |
+|---|---|---|
+| Internet | Nginx :443 | Yes |
+| Internet | Nginx :80 | Yes (redirect only) |
+| Internet | SSH :22 | **No** |
+| Internet | Any DB port | **No** |
+| VPN Admin | SSH :22 | Yes (key auth only) |
+| Employee VLAN | App :443 | Yes |
+| Application | Database | Yes (loopback only) |
+| Database | Internet | **No** |
+
+---
+
+## 3. Network Architecture
+
+### VLAN Design
+
+```
+              EDGE FIREWALL
+                   |
+  +----------------+----------------+
+  |        |            |           |
+  v        v            v           v
+VLAN 10  VLAN 20    VLAN 30    VLAN 40
+Employee  Server     Guest    Management
+.10/24    .20/24     .30/24     .40/24
+```
+
+| VLAN | Subnet | Purpose | Key Restrictions |
+|---|---|---|---|
+| Employee | 192.168.10.0/24 | Staff workstations | No DB, no SSH to server |
+| Server | 192.168.20.0/24 | Production server | Only 443/80 from Internet |
+| Guest | 192.168.30.0/24 | Guest Wi-Fi | Internet only, fully isolated |
+| Management | 192.168.40.0/24 | Admin workstations | SSH to server allowed |
+| VPN | 10.20.0.0/24 | Remote employees & admins | Per-role UFW rules |
+
+### Inter-VLAN Firewall Rules
+
+```
+Default policy: DENY ALL inter-VLAN
+
+Explicit allows:
+  Employee    -> Server :443        ALLOW
+  Management  -> Server :22         ALLOW
+  VPN admin   -> Server :22         ALLOW
+  VPN users   -> Server :443        ALLOW
+  Internet    -> Server :443/:80    ALLOW
+
+Explicit denies (defense-in-depth):
+  Guest       -> Server VLAN        DENY all
+  Guest       -> Employee VLAN      DENY all
+  Employee    -> Server :22         DENY
+  Employee    -> Server DB ports    DENY
+  Internet    -> Server :22         DENY
+  Internet    -> All other ports    DENY
 ```
 
 ---
 
-# 3. Network Architecture
+## 4. Hardware Specification
 
-The company network should not be completely flat.
+### Minimum Recommended
 
-A basic segmentation design:
-
-```text
-                    FIREWALL
-                        |
-        +---------------+----------------+
-        |               |                |
-        v               v                v
-   VLAN 10          VLAN 20          VLAN 30
-   Employees        Servers          Guests
-        |               |                |
-     Employee        Production        Guest
-       PCs            Server           Devices
+```
+CPU:      Server-grade 64-bit (Intel Xeon E or AMD EPYC)
+RAM:      32 GB ECC  (ECC mandatory for DB reliability)
+Storage:  4 x 2 TB Enterprise NVMe/SSD  =>  RAID 10 = ~4 TB usable
+          + 1 x separate SSD for OS boot (not part of RAID)
+Network:  2 x 1 GbE NICs
+PSU:      Redundant if chassis supports it
+UPS:      1500 VA minimum
+Cooling:  Server room or rack with proper airflow
 ```
 
-Recommended:
+### Why ECC RAM?
 
-| Network         | Example subnet    | Purpose                       |
-| --------------- | ----------------- | ----------------------------- |
-| Employee VLAN   | `192.168.10.0/24` | Employee computers            |
-| Server VLAN     | `192.168.20.0/24` | Production servers            |
-| Guest VLAN      | `192.168.30.0/24` | Guest Wi-Fi                   |
-| Management VLAN | `192.168.40.0/24` | Network/server administration |
-| VPN network     | `10.20.0.0/24`    | Remote employees              |
+```
+Standard RAM bit-flip  ->  Silent data corruption  ->  DB corruption
+ECC RAM bit-flip       ->  Auto-corrected          ->  No data loss
+```
 
-These addresses are examples. The actual addressing should be chosen based on the company's existing network.
+ECC RAM is non-negotiable when the database shares the machine.
+
+### Sizing Guide
+
+| Component | Sizing Basis |
+|---|---|
+| RAM | App working set + DB buffer pool + OS overhead |
+| Storage | Projected data x 3 (growth + logs + backup staging) |
+| CPU | Peak concurrent request throughput |
 
 ---
 
-# 4. Hardware
+## 5. Storage — RAID 10
 
-A production server should ideally have:
+### Physical Layout
 
-* Server-grade CPU
-* ECC RAM
-* At least 16–32 GB RAM depending on workload
-* Multiple SSDs
-* RAID controller or supported software RAID
-* Multiple network interfaces if appropriate
-* Redundant PSU if supported
-* Good cooling
-* UPS
-* Hardware monitoring
-
-Example:
-
-```text
-CPU:       Server-grade CPU
-RAM:       32 GB ECC
-Storage:   4 × 2 TB enterprise SSD
-RAID:      RAID 10
-Network:   1/10 GbE depending on workload
-PSU:       Redundant if available
-UPS:       Yes
-OS:        Ubuntu Server 24.04 LTS
+```
+       RAID 10 Controller
+           |
+   +-------+-------+
+   |               |
+Mirror Set 1    Mirror Set 2
+[Disk 1 + 2]   [Disk 3 + 4]
+   |               |
+   +-------+-------+
+           |
+     Striped across both mirrors
 ```
 
-Hardware sizing should ultimately be based on expected traffic, database size, IOPS, and growth.
+### Mount Strategy
+
+```
+Boot SSD (separate, not in RAID):
+  /           root filesystem
+  /boot
+  /home
+  /var/log    (or on a separate partition)
+
+RAID 10 mounted at /data:
+  /data/db/           database files
+  /data/app/          application files
+  /data/backups/      local backup staging
+```
+
+Keeping the OS on a separate drive means a RAID failure does **not** bring down the OS.
+
+| Property | Value |
+|---|---|
+| Raw capacity | 4 x 2 TB = 8 TB |
+| Usable capacity | ~4 TB (after filesystem overhead) |
+| Fault tolerance | 1 drive per mirror set |
+| Rebuild risk | High — take a backup before rebuilding |
+
+> **RAID is not a backup.**
+> RAID protects against disk hardware failure only.
+> It does NOT protect against: deletion, ransomware, corruption, fire, or theft.
 
 ---
 
-# 5. RAID 10
+## 6. Power — UPS
 
-Use four drives for a basic RAID 10 configuration.
+### Power Path
 
-```text
-             RAID 10
-                |
-       +--------+--------+
-       |                 |
-     Mirror            Mirror
-     Disk 1            Disk 3
-       |                 |
-     Disk 2            Disk 4
-       |                 |
-       +--------+--------+
-                |
-             Storage
+```
+Grid Power
+    |
+    v
+UPS (1500 VA minimum)
+    |
+    +-- Server
+    +-- Network switch
+    +-- Edge firewall
 ```
 
-RAID 10 combines:
-
-* Mirroring
-* Striping
-
-### Advantages
-
-* Good read performance
-* Good write performance
-* Drive redundancy
-* Suitable for database workloads
-
-### Capacity
-
-With:
-
-```text
-4 × 2 TB
-```
-
-Raw capacity:
-
-```text
-8 TB
-```
-
-Approximate RAID 10 usable capacity:
-
-```text
-4 TB
-```
-
-Actual usable capacity will be somewhat lower after filesystem and system overhead.
-
-### Important
-
-RAID is **not a backup**.
-
-```text
-RAID = availability/redundancy
-
-Backup = recovery
-```
-
----
-
-# 6. UPS
-
-Power architecture:
-
-```text
-Utility Power
-      |
-      v
-     UPS
-      |
-      v
-   Server
-```
-
-The UPS protects against:
-
-* Short power outages
-* Power interruptions
-* Abrupt shutdowns
-
-Configure the server to perform a controlled shutdown if the UPS battery becomes critically low.
-
----
-
-# 7. Operating System
-
-Install:
-
-```text
-Ubuntu Server 24.04 LTS
-```
-
-Do not install Ubuntu Desktop unless there is a specific requirement for a graphical environment.
-
-The server should primarily be administered through SSH.
-
-```text
-Administrator Laptop
-        |
-        | SSH
-        v
-Ubuntu Server
-```
-
----
-
-# 8. Ubuntu Installation
-
-During installation:
-
-1. Boot from the Ubuntu Server installation media.
-2. Configure the server's RAID/storage system.
-3. Install Ubuntu Server.
-4. Configure hostname.
-
-Example:
-
-```text
-Hostname:
-prod-server-01
-```
-
-5. Configure a static private IP.
-
-Example:
-
-```text
-IP:       192.168.20.20
-Gateway:  192.168.20.1
-DNS:      Company DNS / trusted resolver
-```
-
-6. Create a non-root administrative user.
-7. Install OpenSSH Server.
-8. Complete installation.
-9. Reboot.
-
----
-
-# 9. Initial Ubuntu Configuration
-
-Update the system immediately:
+### UPS Monitoring
 
 ```bash
-sudo apt update
-sudo apt upgrade
+sudo apt install apcupsd
 ```
 
-Install basic tools:
-
-```bash
-sudo apt install curl wget git vim htop unzip ca-certificates
+```
+# /etc/apcupsd/apcupsd.conf
+BATTERYLEVEL 15
+MINUTES 5
+TIMEOUT 0
 ```
 
-Check system information:
+### Alert Levels
+
+```
+Power failure detected  ->  Alert admin immediately
+Battery < 30%           ->  Warning alert
+Battery < 15%           ->  Begin controlled shutdown
+```
+
+> **Limitation:** A UPS provides 5–30 minutes of runtime.
+> It is not a generator. For extended outages, recovery depends
+> on your off-site backups, not the UPS.
+
+---
+
+## 7. Operating System
+
+```
+Ubuntu Server 24.04 LTS — minimal install, no GUI
+```
+
+### Administration Model
+
+```
+Admin workstation
+    |
+    v  WireGuard VPN (step 1)
+Company network
+    |
+    v  SSH with Ed25519 key (step 2)
+Ubuntu Server (Management VLAN or VPN IPs only)
+```
+
+SSH is **never** exposed to the Internet.
+Both authentication barriers must be cleared to reach the server.
+
+---
+
+## 8. Ubuntu Installation
+
+1. Boot from Ubuntu Server 24.04 LTS ISO
+2. Select **minimized installation**
+3. Configure storage:
+   - OS on the separate boot SSD
+   - RAID 10 mounted at `/data`
+4. Set hostname: `prod-server-01`
+5. Configure static IP:
+   ```
+   IP:      192.168.20.20/24
+   Gateway: 192.168.20.1
+   DNS:     192.168.40.1
+   ```
+6. Create non-root admin user: `sysadmin`
+7. Enable OpenSSH Server
+8. Complete and reboot
+
+### Post-Install Verification
 
 ```bash
 hostnamectl
 ip addr
-ip route
-lsblk
+lsblk            # Verify /data mounted on RAID
 df -h
-```
-
-Check listening services:
-
-```bash
-sudo ss -tulpn
+sudo ss -tulpn   # Check all listening services
 ```
 
 ---
 
-# 10. Create Administrative User
+## 9. Initial System Configuration
 
-Create a dedicated administrator:
-
-```bash
-sudo adduser admin
-```
-
-Add the user to sudo:
+### Update First
 
 ```bash
-sudo usermod -aG sudo admin
+sudo apt update && sudo apt upgrade -y
+sudo apt autoremove -y
+sudo reboot
 ```
 
-Do not use the root account for routine administration.
+### Install Essential Tools Only
+
+```bash
+sudo apt install -y curl wget git vim htop unzip \
+  ca-certificates gnupg lsb-release fail2ban ufw net-tools
+```
+
+### Disable Unnecessary Services
+
+```bash
+sudo systemctl list-unit-files --state=enabled
+sudo systemctl disable --now snapd
+sudo systemctl disable --now avahi-daemon
+sudo systemctl disable --now cups
+```
+
+### Enable Automatic Security Updates
+
+```bash
+sudo apt install unattended-upgrades
+sudo dpkg-reconfigure --priority=low unattended-upgrades
+```
+
+```
+# /etc/apt/apt.conf.d/50unattended-upgrades
+
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Mail "admin@company.com";
+```
+
+Security patches apply automatically. Reboots require manual approval.
 
 ---
 
-# 11. SSH Key Authentication
+## 10. User & Privilege Model
 
-Generate an SSH key on the administrator's workstation:
+| Account | Purpose | Shell | sudo |
+|---|---|---|---|
+| `sysadmin` | Server administration | /bin/bash | Yes |
+| `appuser` | Runs application process | /bin/false | No |
+| `postgres` / `mongod` | DB process user | /bin/false | No |
+| `root` | Emergency only — account locked | — | — |
 
-```bash
-ssh-keygen -t ed25519
-```
-
-This produces:
-
-```text
-~/.ssh/id_ed25519
-~/.ssh/id_ed25519.pub
-```
-
-The private key:
-
-```text
-id_ed25519
-```
-
-must remain on the administrator's device.
-
-The public key:
-
-```text
-id_ed25519.pub
-```
-
-is placed on the server.
-
-Example:
+### Create Application Service User
 
 ```bash
-ssh-copy-id admin@192.168.20.20
+sudo adduser --system --no-create-home --shell /bin/false appuser
 ```
 
-The server stores the authorized public key in:
+The application process runs as `appuser`, never as root or sysadmin.
 
-```text
-/home/admin/.ssh/authorized_keys
+### Verify Isolation
+
+```bash
+sudo -l -U appuser   # Must show: not allowed to run sudo
+ls -la /data/app     # Must show: owned by appuser
+ls -la /data/db      # Must show: owned by postgres or mongod
 ```
-
-Authentication conceptually works like:
-
-```text
-Administrator
-     |
-     | Private key
-     v
-Digital signature
-     |
-     v
-SSH Server
-     |
-     | Verify using public key
-     v
-Authentication succeeds
-```
-
-The private key itself is never sent to the server.
 
 ---
 
-# 12. SSH Hardening
+## 11. SSH Hardening
 
-After confirming key-based login works:
+### Generate Key on Admin Workstation
 
-* Disable direct root SSH login.
-* Prefer disabling password authentication.
-* Restrict SSH to the management network/VPN.
-* Use a non-root administrative account.
-* Keep SSH patched.
-
-Example configuration:
-
-```text
-/etc/ssh/sshd_config
+```bash
+ssh-keygen -t ed25519 -C "sysadmin@company.com"
 ```
 
-Relevant settings:
+```
+~/.ssh/id_ed25519      <- Private key — NEVER leaves your workstation
+~/.ssh/id_ed25519.pub  <- Public key — copied to server
+```
 
-```text
+### Copy Public Key and Test
+
+```bash
+ssh-copy-id sysadmin@192.168.20.20
+ssh -i ~/.ssh/id_ed25519 sysadmin@192.168.20.20
+```
+
+Only proceed to hardening after confirming key login works.
+
+### Harden /etc/ssh/sshd_config
+
+```
+Port 22
+Protocol 2
+
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
+AuthenticationMethods publickey
+ChallengeResponseAuthentication no
+UsePAM no
+
+ListenAddress 192.168.20.20
+AllowUsers sysadmin@192.168.40.0/24 sysadmin@10.20.0.0/24
+
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+MaxAuthTries 3
+MaxSessions 4
+
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
 ```
 
-After changes:
-
 ```bash
+sudo sshd -t             # Must show no errors
 sudo systemctl restart ssh
 ```
 
-Do not disable password authentication until key authentication has been tested successfully.
-
 ---
 
-# 13. Host Firewall
+## 12. Host Firewall (UFW)
 
-Ubuntu should have its own firewall even though there is an external firewall.
-
-Concept:
-
-```text
-Internet
-   |
-   v
-Edge Firewall
-   |
-   v
-Ubuntu Host Firewall
-   |
-   v
-Services
-```
-
-Using UFW:
-
-```bash
-sudo apt install ufw
-```
-
-Default policy:
+### Default Policy (deny everything)
 
 ```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
+sudo ufw default deny routed
 ```
 
-Allow HTTPS:
+### Allow Web Traffic
 
 ```bash
-sudo ufw allow 443/tcp
+sudo ufw allow 443/tcp comment 'HTTPS public'
+sudo ufw allow 80/tcp  comment 'HTTP redirect only'
 ```
 
-Allow HTTP if needed for redirection:
+### Allow SSH — Management and VPN Networks Only
 
 ```bash
-sudo ufw allow 80/tcp
+sudo ufw allow from 192.168.40.0/24 to any port 22 proto tcp comment 'SSH management VLAN'
+sudo ufw allow from 10.20.0.0/24    to any port 22 proto tcp comment 'SSH VPN admins'
 ```
 
-SSH should only be allowed from the management network or VPN.
-
-Example:
+### Explicitly Deny Internal Ports
 
 ```bash
-sudo ufw allow from 192.168.40.0/24 to any port 22 proto tcp
+sudo ufw deny 5432/tcp  comment 'PostgreSQL - internal only'
+sudo ufw deny 27017/tcp comment 'MongoDB - internal only'
+sudo ufw deny 3306/tcp  comment 'MySQL - internal only'
+sudo ufw deny 3000/tcp  comment 'App port - internal only'
 ```
 
-Enable:
+### Enable and Verify
 
 ```bash
 sudo ufw enable
-```
-
-Check:
-
-```bash
 sudo ufw status verbose
 ```
 
-Do not expose the database publicly.
+Expected result:
 
----
-
-# 14. Public IP and DNS
-
-The ISP provides the public IP.
-
-Example:
-
-```text
-Public IP:
-203.0.113.50
 ```
-
-DNS:
-
-```text
-company.com
-     |
-     v
-203.0.113.50
-```
-
-The public IP belongs to the company's network edge.
-
-The production server can continue using a private IP:
-
-```text
-Public IP:
-203.0.113.50
-
-Server:
-192.168.20.20
+443/tcp    ALLOW IN  Anywhere
+80/tcp     ALLOW IN  Anywhere
+22/tcp     ALLOW IN  192.168.40.0/24
+22/tcp     ALLOW IN  10.20.0.0/24
+5432/tcp   DENY IN   Anywhere
+27017/tcp  DENY IN   Anywhere
+3000/tcp   DENY IN   Anywhere
 ```
 
 ---
 
-# 15. NAT / Port Forwarding
+## 13. Public IP & DNS
 
-The firewall/router forwards only required public ports.
+```
+ISP provides: 203.0.113.50  (static — request from ISP)
 
-Example:
-
-```text
-Internet
-   |
-   | 203.0.113.50:443
-   v
-Firewall
-   |
-   | NAT
-   v
-192.168.20.20:443
+Internet -> 203.0.113.50 (Edge Firewall) --(NAT)--> 192.168.20.20 (Server)
 ```
 
-Only required services should be forwarded.
+### DNS Records
 
-Example:
-
-```text
-443 → Nginx
-80  → Nginx (optional HTTP → HTTPS redirect)
+```
+company.com.      A     203.0.113.50
+www.company.com.  CNAME company.com.
 ```
 
-Do NOT forward:
-
-```text
-27017 → MongoDB
-5432  → PostgreSQL
-3000  → Node.js
-8080  → internal application
-```
-
-unless there is a specific, justified requirement.
+Use a short TTL (300s) during initial setup for fast propagation.
 
 ---
 
-# 16. Install Nginx
+## 14. NAT / Port Forwarding
 
-Install:
+Configure on the edge firewall only:
+
+| Public Port | Forward To | Service |
+|---|---|---|
+| 443/TCP | 192.168.20.20:443 | Nginx HTTPS |
+| 80/TCP | 192.168.20.20:80 | Nginx HTTP (redirect) |
+| 51820/UDP | 192.168.20.20:51820 | WireGuard VPN |
+
+**Never forward:**
+
+```
+22     ->  SSH         (access via VPN only)
+5432   ->  PostgreSQL  (loopback binding — unreachable anyway)
+27017  ->  MongoDB     (loopback binding — unreachable anyway)
+3000   ->  App port    (loopback binding — unreachable anyway)
+```
+
+---
+
+## 15. Nginx — Reverse Proxy & TLS
+
+### Install
 
 ```bash
 sudo apt install nginx
+sudo systemctl enable --now nginx
 ```
 
-Enable and start:
+### TLS Certificate via Certbot
 
 ```bash
-sudo systemctl enable nginx
-sudo systemctl start nginx
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d company.com -d www.company.com
+sudo certbot renew --dry-run   # Verify auto-renewal
 ```
 
-Check:
-
-```bash
-sudo systemctl status nginx
-```
-
----
-
-# 17. Nginx Reverse Proxy
-
-The public traffic path becomes:
-
-```text
-Customer
-   |
-   | HTTPS
-   v
-Public IP
-   |
-   v
-Firewall
-   |
-   v
-Nginx
-   |
-   | Internal request
-   v
-Application
-```
-
-Suppose the application listens internally on:
-
-```text
-127.0.0.1:3000
-```
-
-Nginx can proxy requests to it.
-
-Conceptual configuration:
+### Rate Limiting (add to http block in nginx.conf)
 
 ```nginx
+# /etc/nginx/nginx.conf — inside http { }
+limit_req_zone $binary_remote_addr zone=api:10m rate=30r/s;
+limit_conn_zone $binary_remote_addr zone=conn:10m;
+```
+
+### Production Site Configuration
+
+```nginx
+# /etc/nginx/sites-available/company.com
+
+# HTTP -> HTTPS redirect
 server {
     listen 80;
-    server_name company.com;
+    listen [::]:80;
+    server_name company.com www.company.com;
+    return 301 https://$host$request_uri;
+}
 
+# HTTPS main block
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name company.com www.company.com;
+
+    ssl_certificate     /etc/letsencrypt/live/company.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/company.com/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    server_tokens off;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+    add_header X-Frame-Options           "SAMEORIGIN" always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy   "default-src 'self'; object-src 'none';" always;
+    add_header Permissions-Policy        "geolocation=(), camera=(), microphone=()" always;
+
+    # Rate limiting
+    limit_req zone=api burst=20 nodelay;
+    limit_req_status 429;
+
+    # Public reverse proxy
     location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_read_timeout    60s;
+        proxy_connect_timeout 10s;
     }
+
+    # Internal admin panel — IP-restricted
+    location /admin {
+        allow 192.168.10.0/24;
+        allow 10.20.0.0/24;
+        deny all;
+        proxy_pass http://127.0.0.1:3000/admin;
+    }
+
+    # Block sensitive file access
+    location ~* \.(env|git|sql|bak|backup)$ {
+        deny all;
+        return 404;
+    }
+
+    access_log /var/log/nginx/company.access.log combined;
+    error_log  /var/log/nginx/company.error.log warn;
 }
 ```
 
-For production, configure HTTPS and redirect HTTP to HTTPS.
-
----
-
-# 18. HTTPS/TLS
-
-The public endpoint should use:
-
-```text
-https://company.com
-```
-
-instead of:
-
-```text
-http://company.com
-```
-
-Traffic:
-
-```text
-Customer
-   |
-   | Encrypted HTTPS
-   v
-Nginx
-   |
-   v
-Application
-```
-
-Nginx can terminate TLS.
-
-This is called:
-
-```text
-TLS termination
-```
-
-Use a trusted certificate and automate certificate renewal.
-
----
-
-# 19. Application Deployment
-
-Deploy the application behind Nginx.
-
-Example:
-
-```text
-Nginx
-  |
-  v
-Node.js / Express
-```
-
-or:
-
-```text
-Nginx
-  |
-  v
-Spring Boot
-```
-
-The application should listen only on an internal interface where possible.
-
-Example:
-
-```text
-127.0.0.1:3000
-```
-
-rather than:
-
-```text
-0.0.0.0:3000
-```
-
-if the application doesn't need direct network access.
-
----
-
-# 20. Application Process Management
-
-The application should automatically restart after failure.
-
-Possible approaches:
-
-* systemd
-* Docker
-* Docker Compose
-* another appropriate process supervisor
-
-Example architecture:
-
-```text
-Application
-     |
-     v
-systemd
-     |
-     +--> restart if process fails
-```
-
-The service should also start automatically after reboot.
-
----
-
-# 21. Database
-
-Install the chosen database.
-
-Examples:
-
-```text
-MongoDB
-PostgreSQL
-MySQL
-```
-
-The database should remain private.
-
-Correct:
-
-```text
-Internet
-   |
-   v
-Nginx
-   |
-   v
-Application
-   |
-   v
-Database
-```
-
-Incorrect:
-
-```text
-Internet
-   |
-   v
-MongoDB :27017
+```bash
+sudo ln -s /etc/nginx/sites-available/company.com /etc/nginx/sites-enabled/
+sudo nginx -t           # Must show: syntax is ok
+sudo systemctl reload nginx
 ```
 
 ---
 
-# 22. Database Security
+## 16. Application Deployment
 
-Create a dedicated database user for the application.
+### Directory Layout
 
-Do not use the database administrator account from the application.
-
-Concept:
-
-```text
-Database
-|
-+-- Administrative account
-|
-+-- Application account
-       |
-       +-- Required database permissions only
+```
+/data/app/
+  current/            <- Active release (symlink)
+    .env              <- Secrets (chmod 640, NOT in git)
+    index.js
+    package.json
+  releases/
+    2026-09-20/       <- Previous release (rollback target)
+  shared/
+    logs/
 ```
 
-Use:
+### Permissions
 
-* Strong credentials
-* Authentication
-* Encryption where appropriate
-* Least privilege
-* Network restrictions
-* Regular backups
+```bash
+sudo chown -R appuser:appuser /data/app
+sudo chmod 750 /data/app
+sudo chmod 640 /data/app/current/.env
+```
 
----
-
-# 23. Application Secrets
-
-Never put production secrets directly into source code.
-
-Do not:
+### Application Binding Rules
 
 ```javascript
-const password = "ProductionPassword123";
+// CORRECT: bind to loopback only
+app.listen(3000, '127.0.0.1');
+
+// WRONG: never bind to all interfaces in production
+app.listen(3000, '0.0.0.0');
 ```
 
-Do not commit:
+```javascript
+// CORRECT: read from environment
+const dbPassword = process.env.DB_PASSWORD;
 
-```text
+// WRONG: never hardcode secrets in source code
+const dbPassword = "secret123";
+```
+
+```javascript
+// CORRECT: connect to DB via loopback
+const DB_HOST = '127.0.0.1';
+
+// WRONG: never use a hostname that could resolve externally
+const DB_HOST = 'localhost'; // Use 127.0.0.1 explicitly
+```
+
+---
+
+## 17. Process Management (systemd)
+
+### systemd vs Docker for a Single Server
+
+| Criterion | systemd | Docker |
+|---|---|---|
+| Complexity | Low | Medium |
+| Overhead | Minimal | Moderate |
+| Auto-restart | Yes | Yes |
+| Start on boot | Yes | Yes |
+| Best fit for 1 service | Yes | Overkill |
+
+Use systemd. Use Docker if you later need multiple isolated services or dev/prod parity.
+
+### Application Service Unit
+
+```ini
+# /etc/systemd/system/app.service
+
+[Unit]
+Description=Production Application
+After=network-online.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=appuser
+Group=appuser
+WorkingDirectory=/data/app/current
+
+# Loads secrets from .env â€” not passed via environment directly
+EnvironmentFile=/data/app/current/.env
+
+ExecStart=/usr/bin/node /data/app/current/index.js
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=80%
+
+# Security hardening directives
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/data/app /data/app/shared/logs
+ProtectHome=true
+
+# Logging goes to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=app
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable app
+sudo systemctl start app
+sudo systemctl status app
+```
+
+### Verify Auto-Restart
+
+```bash
+# Kill the process â€” systemd should restart it within 5 seconds
+sudo kill -9 $(pgrep -f "node /data/app")
+sleep 6
+sudo systemctl status app   # Must show: active (running)
+```
+
+### Rollback
+
+```bash
+sudo systemctl stop app
+sudo ln -sfn /data/app/releases/2026-09-20 /data/app/current
+sudo systemctl start app
+sudo systemctl status app
+```
+
+---
+
+## 18. Database â€” Co-located Setup
+
+### Core Design Decision
+
+The database runs on the **same physical machine** as the application.
+All database connections stay on the **loopback interface** (`127.0.0.1`).
+
+```
+Application  (127.0.0.1:3000)
+        |
+        |  TCP on loopback â€” never leaves the machine
+        v
+Database     (127.0.0.1:5432)
+        |
+        v
+RAID 10      (/data/db/)
+```
+
+Consequences:
+- Database is **unreachable from any network** â€” by binding, not just by firewall
+- Performance is optimal â€” no network latency for database queries
+- No firewall misconfiguration can accidentally expose the database
+
+### PostgreSQL â€” Bind to Loopback
+
+```
+# /etc/postgresql/16/main/postgresql.conf
+listen_addresses = '127.0.0.1'
+port = 5432
+data_directory = '/data/db/postgresql/16/main'
+```
+
+```
+# /etc/postgresql/16/main/pg_hba.conf
+# TYPE  DATABASE  USER      ADDRESS         METHOD
+local   all       postgres                  peer
+host    appdb     appuser   127.0.0.1/32    scram-sha-256
+```
+
+Only `appuser` can connect to `appdb`, only from `127.0.0.1`.
+
+### MongoDB â€” Bind to Loopback
+
+```yaml
+# /etc/mongod.conf
+net:
+  port: 27017
+  bindIp: 127.0.0.1
+
+security:
+  authorization: enabled
+
+storage:
+  dbPath: /data/db/mongodb
+  journal:
+    enabled: true
+```
+
+### Verify After Every Restart
+
+```bash
+sudo ss -tlnp | grep -E '5432|27017'
+```
+
+Must show only `127.0.0.1` â€” never `0.0.0.0`:
+
+```
+LISTEN  127.0.0.1:5432   (postgres)
+LISTEN  127.0.0.1:27017  (mongod)
+```
+
+---
+
+## 19. Database Security
+
+### Least-Privilege Application Account
+
+```sql
+-- PostgreSQL
+
+CREATE DATABASE appdb;
+CREATE USER appuser WITH PASSWORD 'use-a-long-random-password';
+
+GRANT CONNECT ON DATABASE appdb TO appuser;
+GRANT USAGE ON SCHEMA public TO appuser;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO appuser;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO appuser;
+
+-- Revoke overly broad defaults
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE appdb FROM PUBLIC;
+```
+
+### Access Model
+
+```
+postgres superuser  <-  Human DBA via local shell (sudo -u postgres psql)
+appuser             <-  Application process only, password auth, 127.0.0.1
+```
+
+The application **never** uses the `postgres` superuser.
+
+### File Permissions
+
+```bash
+sudo chown -R postgres:postgres /data/db/postgresql
+sudo chmod 700 /data/db/postgresql
+
+sudo chown -R mongod:mongod /data/db/mongodb
+sudo chmod 700 /data/db/mongodb
+```
+
+### Verify Application Cannot Escalate
+
+```bash
+sudo -u appuser psql -U postgres -d appdb   # Must fail
+```
+
+---
+
+## 20. Secrets Management
+
+### Practical Approach for a Single Server
+
+Use a `.env` file with tight filesystem permissions, loaded by systemd:
+
+```bash
+sudo touch /data/app/current/.env
+sudo chown root:appuser /data/app/current/.env
+sudo chmod 640 /data/app/current/.env
+```
+
+```bash
+# /data/app/current/.env
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=appdb
+DB_USER=appuser
+DB_PASSWORD=long-random-secret-here
+APP_SECRET=another-long-random-secret
+NODE_ENV=production
+```
+
+### Rules
+
+```
+Never put secrets in source code
+Never commit .env to git
+Use a different secret for each purpose
+Rotate secrets after any suspected compromise
+```
+
+### .gitignore (mandatory)
+
+```
 .env
+.env.*
+*.pem
+*.key
+secrets/
 ```
 
-to GitHub.
+### Generating Secrets
 
-Use:
-
-* Environment variables
-* Secure secret storage
-* Proper filesystem permissions
-* Secret management systems as the infrastructure grows
-
----
-
-# 24. Employee Network
-
-Employees should use the company LAN.
-
-```text
-Employee PC
-     |
-     v
-Switch / Wi-Fi
-     |
-     v
-Employee VLAN
-     |
-     v
-Firewall
-     |
-     v
-Authorized internal resources
-```
-
-Employees should not automatically have access to:
-
-```text
-Database
-SSH
-Network management
-Other restricted services
-```
-
-Access should be based on business requirements.
-
----
-
-# 25. Remote Employee VPN
-
-Remote employees should not require public exposure of internal services.
-
-Architecture:
-
-```text
-Remote Employee
-       |
-       | Encrypted VPN tunnel
-       v
-Internet
-       |
-       v
-Company Firewall / VPN Gateway
-       |
-       v
-Private Network
-       |
-       v
-Authorized Resources
-```
-
-VPN technologies can include:
-
-* WireGuard
-* OpenVPN
-* IPsec/IKEv2
-* Enterprise firewall VPN
-
----
-
-# 26. VPN Network
-
-Example:
-
-```text
-VPN subnet:
-10.20.0.0/24
-```
-
-An employee might receive:
-
-```text
-10.20.0.25
-```
-
-After authentication, the firewall controls which internal resources they can reach.
-
-Example:
-
-```text
-VPN employee
-     |
-     +---- Internal application :443     ALLOW
-     |
-     +---- File server :445              ALLOW
-     |
-     +---- Database :27017               DENY
-     |
-     +---- SSH :22                       DENY
-```
-
-An administrator could receive different permissions.
-
----
-
-# 27. VPN + SSH for Administrators
-
-For remote server administration:
-
-```text
-Administrator
-      |
-      v
-VPN
-      |
-      v
-Company Network
-      |
-      v
-SSH
-      |
-      v
-Ubuntu Server
-```
-
-Then SSH uses the administrator's key:
-
-```text
-Private Key
-     |
-     v
-Digital Signature
-     |
-     v
-SSH Server
-     |
-     v
-Public Key Verification
-```
-
-This creates two security boundaries:
-
-```text
-VPN → Can you reach the private network?
-
-SSH → Are you authorized to log into this server?
+```bash
+openssl rand -hex 32
 ```
 
 ---
 
-# 28. Network Access Control
+## 21. Internal Service Communication
 
-Example firewall policy:
+### Loopback Trust Model
 
-```text
-Internet
-    |
-    +--> TCP 443 --> Nginx              ALLOW
-    |
-    +--> TCP 80  --> Nginx              ALLOW/REDIRECT
-    |
-    +--> TCP 22  --> Production Server  DENY
-    |
-    +--> TCP 27017 --> Database         DENY
-    |
-    +--> Other ports                    DENY
+```
+Nginx  -> 127.0.0.1:3000 -> Application -> 127.0.0.1:5432 -> Database
 ```
 
-Management network:
+All service-to-service connections stay on the loopback interface.
+No traffic hits the network stack.
 
-```text
-Management VLAN
-    |
-    +--> SSH :22 --> Server             ALLOW
-```
+### Controls at This Layer
 
-VPN administrators:
+| Security Question | Control |
+|---|---|
+| Who can connect to the DB? | pg_hba.conf â€” appuser from 127.0.0.1 only |
+| What can the app do in the DB? | SQL grants â€” SELECT/INSERT/UPDATE/DELETE only |
+| Can appuser read DB config files? | Filesystem permissions â€” No |
+| Can DB process read app files? | Filesystem permissions â€” No |
 
-```text
-Admin VPN
-    |
-    +--> SSH :22 --> Server             ALLOW
+### Adding Future Services
+
+```bash
+# Any new service (Redis, queues, etc.) must also bind to loopback
+# redis.conf: bind 127.0.0.1
+
+# Always add an explicit UFW deny for defense-in-depth
+sudo ufw deny 6379/tcp comment 'Redis - internal only'
 ```
 
 ---
 
-# 29. Application Architecture
+## 22. Employee Network & VLAN
 
-A basic application flow:
+### Access Policy
 
-```text
-Customer
-   |
-   | HTTPS
-   v
-Nginx
-   |
-   | HTTP/internal connection
-   v
-Application
-   |
-   | Database protocol
-   v
-Database
+```
+Employee PC (192.168.10.x)
+    |
+    v  Edge firewall + UFW enforces:
+    |
+    +-- company.com :443     ->  ALLOW  (web application)
+    +-- /admin paths         ->  ALLOW  (Nginx IP restriction)
+    +-- Server SSH :22       ->  DENY
+    +-- Database ports       ->  DENY
+    +-- Guest VLAN           ->  DENY
+    +-- Management VLAN      ->  DENY
 ```
 
-Example request:
-
-```text
-GET /orders
-```
-
-Flow:
-
-```text
-Customer
-   |
-   v
-Nginx
-   |
-   v
-Application
-   |
-   v
-Database
-   |
-   v
-Application
-   |
-   v
-Nginx
-   |
-   v
-Customer
-```
+Employees have no shell access to the server and no direct database access.
 
 ---
 
-# 30. Security Headers
+## 23. Remote Access â€” WireGuard VPN
 
-Configure appropriate security headers at the application or Nginx layer.
+### Install
 
-Examples include:
-
-```text
-Content-Security-Policy
-Strict-Transport-Security
-X-Content-Type-Options
-Referrer-Policy
+```bash
+sudo apt install wireguard
 ```
 
-The exact policy should be tested against the application rather than copied blindly.
+### Server Configuration
+
+```ini
+# /etc/wireguard/wg0.conf
+
+[Interface]
+Address    = 10.20.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private-key>
+PostUp     = iptables -A FORWARD -i wg0 -j ACCEPT
+PostDown   = iptables -D FORWARD -i wg0 -j ACCEPT
+
+[Peer]  # Admin
+PublicKey  = <admin-public-key>
+AllowedIPs = 10.20.0.10/32
+
+[Peer]  # Employee
+PublicKey  = <employee-public-key>
+AllowedIPs = 10.20.0.20/32
+```
+
+```bash
+sudo systemctl enable --now wg-quick@wg0
+```
+
+### Per-Role Access via UFW
+
+```bash
+# Admin can SSH
+sudo ufw allow from 10.20.0.10 to any port 22 proto tcp comment 'VPN admin SSH'
+
+# All VPN users reach the app
+sudo ufw allow from 10.20.0.0/24 to any port 443 proto tcp comment 'VPN HTTPS'
+
+# VPN users cannot reach DB directly
+sudo ufw deny from 10.20.0.0/24 to any port 5432 proto tcp comment 'VPN deny DB'
+```
+
+### Employee Client Config
+
+```ini
+[Interface]
+PrivateKey = <employee-private-key>
+Address    = 10.20.0.20/32
+DNS        = 192.168.40.1
+
+[Peer]
+PublicKey           = <server-public-key>
+Endpoint            = 203.0.113.50:51820
+AllowedIPs          = 192.168.0.0/16, 10.20.0.0/24
+PersistentKeepalive = 25
+```
+
+Only internal IP ranges are tunneled. General Internet traffic goes direct.
+
+### Employee Offboarding
+
+```bash
+sudo wg set wg0 peer <employee-public-key> remove
+sudo wg-quick save wg0
+```
+
+Access is revoked immediately. No full VPN rekey required.
 
 ---
 
-# 31. Rate Limiting
+## 24. Security Headers & Rate Limiting
 
-Nginx/application-level rate limiting can reduce abuse.
+Security headers are defined in the Nginx configuration in Section 15.
 
-Example:
+Test your configuration at: `https://securityheaders.com`
 
-```text
-Client
-   |
-   | 1000 requests/sec
-   v
-Nginx
-   |
-   | Rate limiting
-   v
-Application
+| Header | Protects Against |
+|---|---|
+| Strict-Transport-Security | HTTPS downgrade attacks |
+| Content-Security-Policy | XSS, injection |
+| X-Content-Type-Options | MIME sniffing |
+| X-Frame-Options | Clickjacking |
+| Referrer-Policy | Information leakage |
+| Permissions-Policy | Unwanted browser API use |
+
+### Rate Limiting Layers
+
+```
+Nginx:       30 req/sec per IP    ->  CPU protection
+Application: per-endpoint limits  ->  fine-grained control
+Fail2ban:    bans repeat 429s     ->  blocks persistent abusers
 ```
 
-This protects application resources against certain forms of abuse.
-
-It is not a complete DDoS solution.
+> This is not DDoS protection.
+> For volumetric attacks, add Cloudflare or a CDN upstream.
 
 ---
 
-# 32. DDoS Protection
+## 25. Host Security Hardening
 
-For a serious public application, consider placing upstream protection in front of the server:
+### Fail2ban
 
-```text
-Internet
-    |
-    v
-CDN / DDoS Protection / WAF
-    |
-    v
-Firewall
-    |
-    v
-Nginx
-    |
-    v
-Application
+```bash
+sudo apt install fail2ban
 ```
 
-The exact service depends on the company's requirements and provider.
+```ini
+# /etc/fail2ban/jail.local
 
----
+[DEFAULT]
+bantime  = 3600
+findtime = 600
+maxretry = 5
 
-# 33. Host Security
+[sshd]
+enabled = true
+port    = 22
+logpath = /var/log/auth.log
 
-The Ubuntu server should have:
+[nginx-limit-req]
+enabled = true
+port    = http,https
+logpath = /var/log/nginx/company.error.log
+```
 
-### Firewall
-
-```text
-UFW / nftables
+```bash
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status sshd
 ```
 
 ### AppArmor
 
-Restricts application capabilities.
-
-### Least privilege
-
-Services should not run as root unnecessarily.
-
-### Updates
-
-Regular security updates.
-
-### SSH hardening
-
-Key-based authentication and restricted access.
-
-### Unnecessary services
-
-Disable/remove anything that isn't required.
-
----
-
-# 34. Monitoring
-
-Monitor:
-
-```text
-Hardware
-|
-+-- CPU
-+-- RAM
-+-- Disk
-+-- RAID
-+-- Temperature
-+-- Network
-|
-Services
-|
-+-- Nginx
-+-- Application
-+-- Database
-|
-Security
-|
-+-- SSH
-+-- Firewall
-+-- Authentication
+```bash
+sudo aa-status   # Should show profiles in enforce mode
+sudo apt install apparmor-utils
+sudo aa-enforce /etc/apparmor.d/usr.sbin.nginx
 ```
 
-Set alerts for:
+### Lock Root Account
 
-```text
-High CPU
-High RAM
-Low disk space
-RAID disk failure
-Application failure
-Database failure
-Server unreachable
-Suspicious login attempts
-Certificate expiration
+```bash
+sudo passwd -l root
+```
+
+Root access requires `sudo` from `sysadmin` only.
+
+### Auditd â€” Tamper-Evident Audit Trail
+
+```bash
+sudo apt install auditd
+sudo systemctl enable --now auditd
+```
+
+```
+# /etc/audit/rules.d/production.rules
+
+-a always,exit -F arch=b64 -S execve -F euid=0 -k root_commands
+-w /data/app/current/.env -p rwa -k secrets_access
+-w /etc/ssh/sshd_config -p rwa -k ssh_config
+-w /etc/passwd -p rwa -k user_changes
+```
+
+### Kernel Hardening
+
+```
+# /etc/sysctl.d/99-production.conf
+
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.tcp_syncookies = 1
+fs.suid_dumpable = 0
+```
+
+```bash
+sudo sysctl -p /etc/sysctl.d/99-production.conf
 ```
 
 ---
 
-# 35. Logging
+## 26. Monitoring & Alerting
 
-Collect logs from:
+### Stack
 
-```text
-Nginx
-Application
-Database
-SSH
-Ubuntu
-Firewall
+```
+Node Exporter (system metrics)
+PostgreSQL Exporter (DB metrics)
+          |
+          v
+    Prometheus (collect + store)
+          |
+          v
+     Grafana (dashboards + alerts)
 ```
 
-Example:
+### Install Node Exporter
 
-```text
-Customer request
-      |
-      v
-Nginx access log
-      |
-      v
-Application log
-      |
-      v
-Database log
+```bash
+sudo adduser --system --no-create-home prometheus
+wget https://github.com/prometheus/node_exporter/releases/latest/download/node_exporter-1.8.2.linux-amd64.tar.gz
+tar xzf node_exporter-*.tar.gz
+sudo mv node_exporter-*/node_exporter /usr/local/bin/
 ```
 
-For a mature deployment, consider centralized logging so an attacker who compromises one machine cannot simply erase every useful log.
+```ini
+# /etc/systemd/system/node-exporter.service
 
----
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
 
-# 36. Backups
+[Service]
+User=prometheus
+ExecStart=/usr/local/bin/node_exporter --web.listen-address="127.0.0.1:9100"
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
 
-Use separate backup storage.
-
-```text
-Production Server
-       |
-       v
-Backup System
-       |
-       v
-Off-site Backup
+[Install]
+WantedBy=multi-user.target
 ```
 
-Back up:
+Node Exporter binds to `127.0.0.1:9100` â€” not network-accessible.
 
-* Database
-* Application configuration
-* Important server configuration
-* Certificates/keys where appropriate and securely stored
-* Critical company data
+### Alert Thresholds
 
-Do not rely on RAID as a backup.
+| Metric | Warning | Critical |
+|---|---|---|
+| CPU usage | > 85% for 5 min | â€” |
+| RAM usage | > 90% | â€” |
+| /data disk usage | > 80% | > 90% |
+| RAID health | Any degraded | â€” |
+| App response P99 | > 2s | â€” |
+| App error rate | > 1% | > 5% |
+| SSL cert expiry | < 30 days | < 7 days |
+| Server unreachable | 1 missed check | â€” |
+| Failed SSH logins | > 20 in 1 min | Security alert |
 
----
+### Alert Delivery
 
-# 37. Backup Strategy
-
-A practical strategy should include:
-
-```text
-Daily backups
-+
-Retention policy
-+
-Off-site copy
-+
-Encryption
-+
-Regular restore tests
 ```
-
-A backup is not considered reliable until you have demonstrated that it can actually be restored.
-
----
-
-# 38. Disaster Recovery
-
-If the physical server dies:
-
-```text
-Server failure
-     |
-     v
-Replace/repair hardware
-     |
-     v
-Configure RAID
-     |
-     v
-Install Ubuntu
-     |
-     v
-Restore configuration
-     |
-     v
-Deploy application
-     |
-     v
-Restore database
-     |
-     v
-Test
-     |
-     v
-Return to production
-```
-
-Document this procedure before a disaster happens.
-
----
-
-# 39. RAID Failure
-
-If one drive fails:
-
-```text
-RAID 10
-   |
-   +-- Disk 1 ❌
-   +-- Disk 2 ✅
-   +-- Disk 3 ✅
-   +-- Disk 4 ✅
-```
-
-The array can continue operating depending on the failure pattern.
-
-Replace the failed drive and rebuild the array.
-
-Monitor the rebuild carefully.
-
----
-
-# 40. RAID Is Not Backup
-
-Remember:
-
-```text
-RAID
- ↓
-Hardware failure protection
-
-Backup
- ↓
-Data recovery
-```
-
-RAID does not protect against:
-
-* Accidental deletion
-* Application bugs
-* Ransomware
-* Malicious administrator actions
-* Database corruption
-* Fire
-* Theft
-* Complete server destruction
-
-Separate backups address these scenarios.
-
----
-
-# 41. Power Failure
-
-Architecture:
-
-```text
-Power
-  |
-  v
-UPS
-  |
-  v
-Server
-```
-
-The UPS should be monitored.
-
-If power remains unavailable:
-
-```text
-UPS battery low
-      |
-      v
-Controlled server shutdown
+Grafana alert fires
+    |
+    +-- Email to admin@company.com
+    +-- Slack / Telegram webhook
 ```
 
 ---
 
-# 42. Security Architecture
+## 27. Centralized Logging
 
-The security model should follow defense in depth:
+### Why Off-Server Logging Is Required
 
-```text
-                    ATTACKER
-                       |
-                       v
-                Edge Firewall
-                       |
-                       v
-                 Network ACLs
-                       |
-                       v
-                    Nginx
-                       |
-                       v
-              Application Security
-                       |
-                       v
-              Authentication
-                       |
-                       v
-                Authorization
-                       |
-                       v
-              Database Security
-                       |
-                       v
-                   Backups
+```
+Attacker compromises server
+    |
+    v
+Deletes /var/log/* and clears journald
+    |
+    v
+No forensic evidence
 ```
 
-No single component should be considered the only security control.
+Ship logs off the server as they are written:
+
+```
+Nginx logs
+Auth logs             Promtail     Loki (remote)    Grafana
+App logs (journald)  --------->  ------------->  ----------> search
+DB logs
+```
+
+### Promtail Configuration
+
+```yaml
+# /etc/promtail/config.yml
+
+clients:
+  - url: http://your-loki-host:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: nginx
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: nginx
+          host: prod-server-01
+          __path__: /var/log/nginx/*.log
+
+  - job_name: system
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: system
+          host: prod-server-01
+          __path__: /var/log/auth.log
+
+  - job_name: app
+    journal:
+      labels:
+        job: app
+        unit: app.service
+```
+
+Loki can run on a separate server or a cloud-hosted Grafana Cloud instance.
 
 ---
 
-# 43. Public Attack Surface
+## 28. Backup Strategy
 
-Keep the Internet-facing attack surface small.
+### 3-2-1 Rule
 
-Ideally:
+```
+3 copies of data:
+  1. Live RAID 10 data       ->  production
+  2. Local /data/backups     ->  fast local restore
+  3. Off-site S3 or NAS      ->  disaster recovery
 
-```text
-PUBLIC
-  |
-  +-- TCP 443 → Nginx
-  |
-  +-- TCP 80  → HTTP → HTTPS redirect
+2 storage types: NVMe RAID + Cloud
+1 off-site location: S3, Backblaze B2, or remote NAS
 ```
 
-Avoid publicly exposing:
+### What to Back Up
 
-```text
-MongoDB
-PostgreSQL
-Redis
-Node.js
-Spring Boot
-SSH
-Internal admin tools
+| Item | Frequency | Method |
+|---|---|---|
+| Database dump | Daily at 2 AM | pg_dump + gzip |
+| App config + .env | Daily | rsync (encrypted) |
+| Nginx config | Daily | rsync |
+| systemd units | Daily | rsync /etc/systemd |
+| SSL certs | Auto-managed | certbot |
+
+### Backup Script
+
+```bash
+#!/bin/bash
+# /usr/local/bin/backup.sh
+set -euo pipefail
+
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M)
+DIR="/data/backups/${TIMESTAMP}"
+BUCKET="s3://company-backups/prod-server-01"
+
+mkdir -p "${DIR}"
+
+# Database
+pg_dump -U postgres appdb | gzip > "${DIR}/appdb.sql.gz"
+
+# Application and config files
+rsync -a /data/app/current/      "${DIR}/app/"
+rsync -a /etc/nginx/             "${DIR}/nginx/"
+rsync -a /etc/systemd/system/    "${DIR}/systemd/"
+
+# Encrypt the DB dump
+gpg --symmetric --cipher-algo AES256 \
+    --passphrase-file /root/.backup-passphrase \
+    "${DIR}/appdb.sql.gz"
+rm "${DIR}/appdb.sql.gz"
+
+# Upload off-site
+aws s3 sync "${DIR}" "${BUCKET}/${TIMESTAMP}/" --storage-class STANDARD_IA
+
+# Remove local backups older than 7 days
+find /data/backups -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
+
+echo "[${TIMESTAMP}] Backup complete"
 ```
 
-unless there is a specific architectural reason.
+```bash
+# Schedule daily at 2 AM
+sudo crontab -e
+# Add: 0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1
+```
+
+### Recovery Objectives
+
+| Scenario | RPO (data loss) | RTO (downtime) |
+|---|---|---|
+| App crash | 0 | 5 seconds (systemd restart) |
+| Single disk failure | 0 | 0 (RAID continues) |
+| DB corruption | Up to 24 hours | 2â€“4 hours |
+| Full server loss | Up to 24 hours | 4â€“8 hours |
+
+> These are targets. **Measure your actual RTO during restore drills.**
+> Run a restore drill on a test machine every month.
+> A backup that has never been tested is not a backup â€” it is an assumption.
+
+### Monthly Restore Drill
+
+```bash
+# On a test machine
+aws s3 cp s3://company-backups/prod-server-01/latest/appdb.sql.gz.gpg ./
+
+gpg --decrypt --passphrase-file /root/.backup-passphrase \
+    appdb.sql.gz.gpg | gunzip > appdb.sql
+
+psql -U postgres -c "CREATE DATABASE appdb_test;"
+psql -U postgres appdb_test < appdb.sql
+psql -U postgres appdb_test -c "SELECT COUNT(*) FROM users;"
+
+echo "Restore drill: PASSED"
+```
 
 ---
 
-# 44. Complete Traffic Flows
+## 29. Disaster Recovery
 
-## Customer
+### Scenario Responses
 
-```text
-Customer
-   |
-   v
+| Scenario | Response |
+|---|---|
+| Application crash | systemd auto-restarts in 5s â€” no action needed |
+| OOM kill | systemd restarts â€” investigate memory trend |
+| One disk failure | RAID continues â€” replace drive, rebuild, monitor |
+| All disks fail | Restore from off-site backup |
+| Server hardware dies | Provision new server, restore from off-site |
+| Ransomware | Wipe server, restore from off-site |
+| Data accidentally deleted | Restore from backup |
+
+### Full Server Rebuild Procedure
+
+```
+1.  Provision replacement hardware or cloud VM
+2.  Install Ubuntu Server 24.04 LTS
+3.  Configure RAID 10 on /data
+4.  Install PostgreSQL / MongoDB, Nginx, Node.js
+5.  Restore /etc/nginx and /etc/systemd from backup
+6.  Download and decrypt DB backup from off-site
+7.  Restore: psql appdb < appdb.sql
+8.  Deploy application from git
+9.  Restore .env from encrypted backup
+10. Start: systemctl start postgresql nginx app
+11. Update DNS if the IP address changed
+12. Run smoke tests
+13. Notify stakeholders
+```
+
+**Target: complete rebuild in under 8 hours with a documented and practiced procedure.**
+
+Run a full drill on a test machine once per year. Update the procedure whenever steps are wrong.
+
+---
+
+## 30. Deployment Order
+
+### Phase 1 â€” Hardware
+- [ ] Install server, 4 RAID drives, and separate OS SSD
+- [ ] Configure RAID 10
+- [ ] Connect UPS and verify communication to server
+- [ ] Connect redundant PSU if available
+
+### Phase 2 â€” Network
+- [ ] Configure edge firewall
+- [ ] Obtain static public IP from ISP
+- [ ] Configure VLANs 10, 20, 30, 40
+- [ ] Set inter-VLAN rules (deny-all default + explicit allows)
+- [ ] Configure NAT: 443, 80, 51820 only
+- [ ] Configure WireGuard VPN
+- [ ] Test: Guest VLAN cannot reach Server VLAN
+
+### Phase 3 â€” OS
+- [ ] Install Ubuntu Server 24.04 LTS (minimal)
+- [ ] Verify /data RAID mount
+- [ ] Set static IP: 192.168.20.20
+- [ ] Apply system updates
+- [ ] Configure unattended-upgrades
+- [ ] Disable unnecessary services
+
+### Phase 4 â€” SSH
+- [ ] Generate Ed25519 keys on admin workstation
+- [ ] Copy public key to server
+- [ ] Test key-based login
+- [ ] Apply hardened sshd_config
+- [ ] Verify: VPN + SSH works for admin
+- [ ] Verify: Internet -> SSH is denied (test externally)
+
+### Phase 5 â€” Host Security
+- [ ] Enable UFW with deny-all defaults
+- [ ] Add allow rules (443, 80, SSH from VLAN/VPN)
+- [ ] Add deny rules for DB and app ports
+- [ ] Install and configure Fail2ban
+- [ ] Verify AppArmor enforcing
+- [ ] Apply sysctl hardening
+- [ ] Install auditd with production rules
+- [ ] Lock root account
+
+### Phase 6 â€” Database
+- [ ] Install PostgreSQL or MongoDB
+- [ ] Bind to 127.0.0.1 only
+- [ ] Verify: ss -tlnp shows only 127.0.0.1
+- [ ] Create appdb and appuser
+- [ ] Apply least-privilege grants
+- [ ] Set /data/db permissions (mode 700)
+- [ ] Test: psql -U appuser -h 127.0.0.1 appdb
+
+### Phase 7 â€” Web Layer
+- [ ] Install Nginx
+- [ ] Configure DNS A record
+- [ ] Obtain Let's Encrypt certificate
+- [ ] Apply production Nginx config
+- [ ] Test: nginx -t (no errors)
+- [ ] Test: HTTPS in browser
+- [ ] Test: HTTP redirects to HTTPS
+- [ ] Test: curl -I shows all security headers
+
+### Phase 8 â€” Application
+- [ ] Create appuser service account
+- [ ] Create /data/app directory structure
+- [ ] Deploy application code
+- [ ] Create .env (chmod 640, not in git)
+- [ ] Install systemd service unit
+- [ ] Enable and start: systemctl enable --now app
+- [ ] Verify: app listening on 127.0.0.1:3000 only
+- [ ] Test end-to-end: browser -> Nginx -> App -> DB
+
+### Phase 9 â€” Monitoring
+- [ ] Install Node Exporter (127.0.0.1:9100)
+- [ ] Install DB exporter
+- [ ] Connect Prometheus + Grafana
+- [ ] Configure all alert thresholds
+- [ ] Test: trigger an alert, verify delivery
+
+### Phase 10 â€” Logging
+- [ ] Install Promtail
+- [ ] Configure shipping to Loki
+- [ ] Verify logs appear in Grafana
+- [ ] Test: generate a 404 in Nginx, verify it appears in Grafana
+
+### Phase 11 â€” Backups
+- [ ] Create /usr/local/bin/backup.sh
+- [ ] Configure off-site storage credentials
+- [ ] Run backup manually and verify all files
+- [ ] Schedule daily cron at 2 AM
+- [ ] Run restore drill on a test machine
+- [ ] Document the tested restore procedure
+
+### Phase 12 â€” Security Validation
+- [ ] Port scan from Internet: only 80 and 443 should be visible
+- [ ] Verify SSH unreachable from Internet
+- [ ] Verify DB ports unreachable from Internet
+- [ ] Check headers at securityheaders.com
+- [ ] Run: sudo lynis audit system
+- [ ] Confirm VPN + SSH works for admin
+- [ ] Confirm Guest VLAN cannot reach Server VLAN
+
+---
+
+## 31. Pre-Production Checklist
+
+### Hardware
+- [ ] RAID 10 healthy (cat /proc/mdstat)
+- [ ] UPS connected and apcupsd monitoring active
+- [ ] Boot drive separate from RAID
+- [ ] Temperatures normal
+
+### Network
+- [ ] Static public IP confirmed
+- [ ] DNS resolves correctly
+- [ ] NAT: only 443, 80, 51820 forwarded
+- [ ] VLAN isolation verified
+- [ ] Guest VLAN cannot reach Server VLAN (tested)
+- [ ] WireGuard VPN working
+
+### OS & Security
+- [ ] Ubuntu 24.04 LTS, fully patched
+- [ ] Root account locked
+- [ ] sysadmin uses Ed25519 SSH key only
+- [ ] UFW enabled with deny-all defaults
+- [ ] Fail2ban active
+- [ ] AppArmor enforcing
+- [ ] auditd running
+- [ ] unattended-upgrades enabled
+
+### SSH
+- [ ] Root login disabled
+- [ ] Password authentication disabled
+- [ ] Key authentication only
+- [ ] SSH accessible only from Management VLAN + VPN
+- [ ] Internet -> SSH blocked (tested from external)
+
+### Database
+- [ ] Listening on 127.0.0.1 only
+- [ ] Authentication enabled
+- [ ] appuser has only required grants
+- [ ] DB admin account separate from application account
+- [ ] /data/db owned by DB process user (mode 700)
+- [ ] External access blocked (tested)
+
+### Application
+- [ ] Listening on 127.0.0.1:3000 only
+- [ ] Running as appuser (not root)
+- [ ] .env: chmod 640, not in git, not in repo history
+- [ ] systemd: auto-restart enabled
+- [ ] systemd: starts on boot
+- [ ] App -> DB connection working
+
+### Nginx & TLS
+- [ ] HTTPS working
+- [ ] HTTP redirects to HTTPS
+- [ ] TLS 1.2 and 1.3 only
+- [ ] All security headers present
+- [ ] Rate limiting active
+- [ ] Certbot auto-renewal verified (dry-run passes)
+
+### Monitoring
+- [ ] Node Exporter running on 127.0.0.1 only
+- [ ] Grafana dashboards showing data
+- [ ] All alerts configured and tested
+- [ ] Alert delivery confirmed (email + Slack)
+
+### Logging
+- [ ] Promtail shipping logs to Loki
+- [ ] Nginx, auth, and app logs visible in Grafana
+
+### Backups
+- [ ] Daily backup scheduled and running
+- [ ] Off-site copy confirmed written
+- [ ] Backup encrypted
+- [ ] Restore drill completed on a test machine
+- [ ] Restore procedure documented and reviewed
+
+---
+
+## Summary
+
+### Architecture in One View
+
+```
 Internet
-   |
-   v
-Public IP
-   |
-   v
-Edge Firewall
-   |
-   v
-Nginx
-   |
-   v
-Application
-   |
-   v
-Database
+    |
+    v  Ports 443, 80, 51820 only
+Edge Firewall  (NAT + VLANs + WireGuard VPN)
+    |
+    v  HTTPS only
+Nginx  (TLS termination, security headers, rate limiting)
+    |
+    v  127.0.0.1:3000  (loopback)
+Application  (appuser, systemd, loopback bind)
+    |
+    v  127.0.0.1:5432  (loopback)
+Database  (127.0.0.1 bind, least-privilege user)
+    |
+    v
+RAID 10 /data  (survives 1 disk failure per mirror)
+    |
+    v
+Encrypted daily backup  ->  Off-site storage
+    |
+Monitoring (Prometheus + Grafana, all on loopback)
+Logging    (Promtail -> Loki, logs leave before they can be wiped)
 ```
 
-## Employee in office
-
-```text
-Employee
-   |
-   v
-Company LAN
-   |
-   v
-Employee VLAN
-   |
-   v
-Firewall
-   |
-   v
-Authorized Internal Resource
-```
-
-## Remote employee
-
-```text
-Employee
-   |
-   v
-Internet
-   |
-   v
-VPN
-   |
-   v
-Company Firewall
-   |
-   v
-Private Network
-   |
-   v
-Authorized Resource
-```
-
-## Remote administrator
-
-```text
-Administrator
-   |
-   v
-VPN
-   |
-   v
-Private Network
-   |
-   v
-SSH
-   |
-   v
-Ubuntu Server
-   |
-   v
-SSH Public-Key Authentication
-```
-
-## Application → Database
-
-```text
-Application
-     |
-     | Private network
-     v
-Database
-```
-
-The database does not need to be exposed to customers.
-
----
-
-# 45. Production Deployment Order
-
-The recommended implementation order is:
-
-## Phase 1 — Hardware
-
-* Install server hardware.
-* Install RAID drives.
-* Configure RAID 10.
-* Connect redundant power if available.
-* Connect UPS.
-* Connect network interfaces.
-
-## Phase 2 — Network
-
-* Configure ISP connection.
-* Configure firewall/router.
-* Obtain public IP.
-* Configure internal addressing.
-* Configure VLANs.
-* Configure server VLAN.
-* Configure management network.
-* Configure employee network.
-* Configure guest network.
-* Configure VPN.
-
-## Phase 3 — Operating System
-
-* Install Ubuntu Server 24.04 LTS.
-* Configure hostname.
-* Configure static IP.
-* Create administrator.
-* Install OpenSSH.
-* Apply updates.
-* Configure host firewall.
-* Enable AppArmor.
-* Disable unnecessary services.
-
-## Phase 4 — SSH
-
-* Generate Ed25519 SSH keys.
-* Install public key on server.
-* Test key authentication.
-* Disable direct root login.
-* Disable password authentication after verification.
-* Restrict SSH to management/VPN networks.
-
-## Phase 5 — Web Layer
-
-* Install Nginx.
-* Configure domain.
-* Configure DNS.
-* Configure HTTP/HTTPS.
-* Install TLS certificate.
-* Configure reverse proxy.
-* Configure security headers.
-* Configure access logging.
-* Configure rate limiting where appropriate.
-
-## Phase 6 — Application
-
-* Deploy application.
-* Configure environment variables/secrets.
-* Create dedicated service user.
-* Configure application process manager.
-* Bind application to an internal interface.
-* Test application.
-* Configure automatic restart.
-
-## Phase 7 — Database
-
-* Install database.
-* Enable authentication.
-* Create application database/user.
-* Restrict network access.
-* Configure database storage.
-* Configure database backups.
-* Test database connection from application.
-
-## Phase 8 — Employees
-
-* Configure employee VLAN.
-* Configure access rules.
-* Configure internal applications/resources.
-* Configure VPN access for remote employees.
-* Apply least-privilege access.
-
-## Phase 9 — Monitoring
-
-* Monitor CPU.
-* Monitor RAM.
-* Monitor storage.
-* Monitor RAID.
-* Monitor network.
-* Monitor Nginx.
-* Monitor application.
-* Monitor database.
-* Monitor SSH/security events.
-* Configure alerts.
-
-## Phase 10 — Backups
-
-* Configure automated database backups.
-* Configure server configuration backups.
-* Store backups separately.
-* Maintain off-site copies.
-* Encrypt sensitive backups.
-* Test restoration.
-
-## Phase 11 — Security Testing
-
-Test:
-
-```text
-External:
-- Port scanning
-- HTTPS configuration
-- Unnecessary exposed ports
-- Application vulnerabilities
-
-Internal:
-- VLAN isolation
-- Employee access restrictions
-- VPN access
-- Database accessibility
-
-Server:
-- SSH configuration
-- Firewall
-- Permissions
-- Services
-- Updates
-```
-
----
-
-# 46. Pre-Production Checklist
-
-## Hardware
-
-* [ ] RAID 10 configured
-* [ ] RAID health verified
-* [ ] UPS configured
-* [ ] Cooling verified
-* [ ] Hardware monitoring configured
-
-## Network
-
-* [ ] Public IP configured
-* [ ] DNS configured
-* [ ] Firewall configured
-* [ ] NAT configured
-* [ ] Server VLAN configured
-* [ ] Employee VLAN configured
-* [ ] Guest VLAN configured
-* [ ] Management network configured
-* [ ] VPN configured
-
-## Ubuntu
-
-* [ ] Ubuntu Server LTS installed
-* [ ] System updated
-* [ ] Static IP configured
-* [ ] Administrator created
-* [ ] SSH configured
-* [ ] Host firewall enabled
-* [ ] AppArmor enabled
-* [ ] Unnecessary services disabled
-
-## SSH
-
-* [ ] Ed25519 keys generated
-* [ ] Public key installed
-* [ ] Key authentication tested
-* [ ] Root SSH disabled
-* [ ] Password SSH disabled
-* [ ] SSH restricted to management/VPN
-
-## Nginx
-
-* [ ] Nginx installed
-* [ ] Domain configured
-* [ ] HTTPS configured
-* [ ] TLS certificate installed
-* [ ] Reverse proxy configured
-* [ ] Security headers configured
-* [ ] Logging configured
-
-## Application
-
-* [ ] Application deployed
-* [ ] Application user created
-* [ ] Secrets secured
-* [ ] Application bound internally
-* [ ] Automatic restart configured
-* [ ] Health check configured
-
-## Database
-
-* [ ] Database installed
-* [ ] Authentication enabled
-* [ ] Application DB user created
-* [ ] Least privilege applied
-* [ ] Database not publicly accessible
-* [ ] Backups configured
-
-## Employees
-
-* [ ] LAN access tested
-* [ ] VLAN restrictions tested
-* [ ] VPN tested
-* [ ] Internal resources tested
-* [ ] Least privilege verified
-
-## Monitoring
-
-* [ ] CPU monitoring
-* [ ] RAM monitoring
-* [ ] Disk monitoring
-* [ ] RAID monitoring
-* [ ] Network monitoring
-* [ ] Application monitoring
-* [ ] Database monitoring
-* [ ] Security alerts
-
-## Backup
-
-* [ ] Database backup tested
-* [ ] Configuration backup tested
-* [ ] Off-site backup configured
-* [ ] Restore procedure documented
-* [ ] Restore test completed
-
----
-
-# 47. Final Architecture
-
-```text
-                               INTERNET
-                                   |
-                                   |
-                              Public IP
-                                   |
-                                   v
-                     +-------------------------+
-                     |    EDGE FIREWALL        |
-                     |                         |
-                     | NAT                     |
-                     | Firewall                |
-                     | VPN                     |
-                     | Routing                 |
-                     +------------+------------+
-                                  |
-              +-------------------+-------------------+
-              |                   |                   |
-              v                   v                   v
-         Public Web          Employee LAN        Remote VPN
-              |                   |                   |
-              v                   v                   |
-        +-----------+        Employee VLAN            |
-        |   NGINX   |              |                  |
-        | HTTPS      |              |                  |
-        | Reverse    |              |                  |
-        | Proxy      |              |                  |
-        +-----+-----+              |                  |
-              |                    |                  |
-              +--------------------+------------------+
-                                   |
-                                   v
-                       +-----------------------+
-                       |   SERVER VLAN         |
-                       |                       |
-                       |  Ubuntu Server        |
-                       |                       |
-                       |  +----------------+  |
-                       |  | Nginx           |  |
-                       |  +-------+--------+  |
-                       |          |            |
-                       |  +-------v--------+  |
-                       |  | Application    |  |
-                       |  +-------+--------+  |
-                       |          |            |
-                       |  +-------v--------+  |
-                       |  | Database       |  |
-                       |  +----------------+  |
-                       |                       |
-                       |  Host Firewall        |
-                       |  AppArmor              |
-                       |  SSH                   |
-                       |  Monitoring            |
-                       |  Logging               |
-                       +-----------+-----------+
-                                   |
-                                RAID 10
-                                   |
-                     +-------------+-------------+
-                     |                           |
-                 Production                  Separate
-                    Data                     Backups
-                                                 |
-                                                 v
-                                           Off-site Copy
-```
-
----
-
-# 48. Core Security Principle
-
-The architecture should follow this rule:
-
-```text
-Internet
-   ↓
-Only expose what is necessary
-   ↓
-Authenticate users
-   ↓
-Authorize only required actions
-   ↓
-Keep databases/internal services private
-   ↓
-Segment networks
-   ↓
-Use least privilege
-   ↓
-Monitor everything important
-   ↓
-Maintain independent backups
-   ↓
-Test recovery
-```
-
-The most important distinction to retain is:
-
-```text
-Firewall  → Controls network access
-
-VPN       → Provides authenticated private network access
-
-SSH       → Authenticates administrators to the server
-
-Nginx     → Public web entry point / reverse proxy
-
-Application → Business logic
-
-Database  → Data storage
-
-RAID 10   → Storage redundancy
-
-Backup    → Disaster recovery
-
-Monitoring → Detects failures and suspicious activit
-```
+### Component Responsibilities
+
+| Component | Responsibility |
+|---|---|
+| Edge Firewall | Network perimeter: NAT, VLANs, VPN endpoint |
+| UFW | Host defense-in-depth: blocks anything the edge misses |
+| Nginx | Public entry: TLS, headers, rate limiting, proxy |
+| Application | Business logic: loopback only, least-privilege user |
+| Database | Data storage: loopback only, restricted grants |
+| RAID 10 | Disk redundancy: survives one drive failure per mirror |
+| Backups | Disaster recovery: survives total server destruction |
+| Monitoring | Visibility: detect failures before users notice |
+| WireGuard VPN | Authenticated network access for remote staff |
+| SSH | Server administration: VPN + key both required |
