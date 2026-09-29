@@ -1,28 +1,30 @@
 # Production Architecture: Single-Server Deployment
 
-## 1. Architectural Foundation & Optimal Technology Stack
+## 1. The Foundation & Tech Stack
 
-This architecture establishes a hardened, single-node bare-metal production deployment that co-locates the reverse proxy, application runtime, and persistence database on a single physical host. 
+This setup runs everything on one well-hardened bare-metal machine: the reverse proxy, your application, and the database all live side-by-side on a single physical host.
 
-The core architectural mandate is **hardware-level performance with operating-system-level isolation**: inter-service traffic executes in-memory over the virtual loopback adapter (`127.0.0.1`) at microsecond latencies, while security, resource limits, and privilege separation are strictly enforced by the Linux kernel, systemd cgroups, and network firewalls. The architecture is fully **language-agnostic and database-agnostic**.
+The guiding philosophy is simple — **bare-metal speed with kernel-level isolation**. Services talk to each other over the loopback adapter (`127.0.0.1`) at microsecond latencies, so there's no network hop overhead. Meanwhile, the Linux kernel, systemd, and UFW enforce strict security boundaries between those services. This design works with any programming language and any database engine.
 
-### Optimal Production Technology Stack & Versions
+### Recommended Tech Stack
 
-| Architectural Layer | Recommended Technology | Optimal Production Version | Core Architectural Role |
+| Layer | Technology | Version | What It Does |
 |---|---|---|---|
-| **Operating System** | Ubuntu Server LTS | **24.04 LTS (Noble Numbat)** | Linux Kernel 6.8+ providing cgroups v2 resource envelopes, AppArmor, eBPF telemetry hooks, and long-term security maintenance. |
-| **Server Hardware** | Enterprise 1U/2U Rack Server (Dell PowerEdge / HPE ProLiant) | **Latest Gen (AMD EPYC / Intel Xeon)** | 16+ Cores, 64GB+ ECC RAM, Dual Redundant Hot-Swap PSUs, IPMI/iDRAC out-of-band management on isolated VLAN. |
-| **Storage Subsystem** | 4x Enterprise NVMe SSDs | **PCIe Gen 4/5 Enterprise** | Arranged in RAID 10 (Striped Mirrors) for high random-write IOPS, zero parity latency, and multi-drive failure tolerance. |
-| **Power Continuity** | Smart On-Line UPS with USB/SNMP | **Network UPS Tools (NUT) / apcupsd** | Battery backup with dual-rail power feeds; triggers automated database buffer flush and graceful shutdown on power failure. |
-| **Edge Firewall / Router** | OPNsense / pfSense | **OPNsense 24.7 / pfSense Plus 24.03** | Perimeter NAT gateway, Layer-3 VLAN routing, stateful packet filtering, and WireGuard VPN tunnel endpoint. |
-| **Reverse Proxy & Ingress** | Nginx | **1.26 LTS** | High-concurrency event-driven TLS 1.3 termination, HTTP security headers, leaky-bucket rate limiting, and request buffering. |
-| **Host-Level Firewall** | UFW / Netfilter (iptables) | **UFW 0.36+ (iptables 1.8.10+)** | Autonomous host packet filtering with default-deny ingress; drops external access to internal application and database ports. |
-| **Administrative Bastion** | WireGuard | **1.0.0+ (In-Kernel Module)** | Encrypted Noise protocol tunnel (ChaCha20-Poly1305) with Ed25519 key authentication; eliminates public SSH port exposure. |
-| **Process Supervision** | systemd | **v255+** | Native PID 1 process lifecycle management, automated crash recovery, hard memory ceilings (`MemoryMax`), and filesystem sandboxing. |
-| **Observability Telemetry** | Prometheus Node Exporter & Promtail | **Node Exporter 1.8+, Promtail 3.1+** | Out-of-band metrics export and real-time inotify log streaming to external Grafana and Loki clusters. |
-| **Disaster Recovery Storage** | S3-Compatible Object Storage | **AWS S3 / Wasabi (WORM Mode)** | Off-site immutable backup repository with Object Lock in Compliance Mode, providing immunity against ransomware. |
+| **Operating System** | Ubuntu Server LTS | **24.04 LTS (Noble Numbat)** | Linux Kernel 6.8+ with cgroups v2, AppArmor, eBPF telemetry, and long-term security patches. |
+| **Server Hardware** | Enterprise 1U/2U Rack (Dell PowerEdge / HPE ProLiant) | **Latest Gen (AMD EPYC / Intel Xeon)** | 16+ cores, 64GB+ ECC RAM, dual hot-swap PSUs, IPMI/iDRAC out-of-band management on its own VLAN. |
+| **Storage** | 4× Enterprise NVMe SSDs | **PCIe Gen 4/5 Enterprise** | RAID 10 (striped mirrors) for high random-write IOPS, no parity overhead, and tolerance for up to two drive failures. |
+| **Power Continuity** | Smart On-Line UPS (USB/SNMP) | **NUT / apcupsd** | Battery backup with dual-rail feeds. Triggers a safe database flush and clean shutdown when power fails. |
+| **Edge Firewall** | OPNsense / pfSense | **OPNsense 24.7 / pfSense Plus 24.03** | Perimeter NAT gateway, VLAN routing, stateful packet filtering, and WireGuard VPN endpoint. |
+| **Reverse Proxy** | Nginx | **1.26 LTS** | High-concurrency TLS 1.3 termination, security headers, rate limiting, and request buffering. |
+| **Host Firewall** | UFW / Netfilter (iptables) | **UFW 0.36+ / iptables 1.8.10+** | Default-deny on all inbound traffic. External access to internal ports is silently dropped. |
+| **Admin Access** | WireGuard | **1.0.0+ (In-Kernel)** | Encrypted Noise-protocol tunnel (ChaCha20-Poly1305) with Ed25519 key auth — no public SSH port needed. |
+| **Process Manager** | systemd | **v255+** | Manages service lifecycles, auto-restarts on crashes, enforces memory ceilings (`MemoryMax`), and sandboxes the filesystem. |
+| **Observability** | Prometheus Node Exporter & Promtail | **Node Exporter 1.8+, Promtail 3.1+** | Ships metrics and log streams out-of-band to an external Grafana + Loki cluster. |
+| **Backup Storage** | S3-Compatible Object Storage | **AWS S3 / Wasabi (WORM Mode)** | Off-site immutable backups with Object Lock in Compliance Mode — ransomware can't delete them. |
 
-### The Four Isolation Rings of the Architecture
+### The Four Rings of Isolation
+
+Think of the security model as four concentric rings. Each ring adds another layer of protection:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -50,88 +52,86 @@ The core architectural mandate is **hardware-level performance with operating-sy
 
 ---
 
-## 2. Core Architecture & Inter-Service Workflow
+## 2. How Traffic Flows Through the System
 
-The backend application service and the database engine run co-located on a single physical host. Communication between tiers stays strictly inside memory over the virtual loopback adapter (`127.0.0.1`) and local Unix domain sockets. The architecture operates identically regardless of the chosen backend programming language or database engine.
+The app and the database live on the same physical machine. They talk to each other entirely in memory — no network packets, no latency — over the loopback adapter (`127.0.0.1`) and local Unix sockets. This works regardless of which backend language or database you choose.
 
 ![Macro Architecture Blueprint](assets/01-macro-architecture.jpg)
 
-### End-to-End Traffic Pipeline
+### End-to-End Request Journey
 
-1. **Incoming Traffic Ingestion:**
-   - **Public Users:** Inbound web traffic arrives via public DNS and hits the edge perimeter on TCP port 443 (HTTPS).
-   - **Office Staff:** Employees on the office network reach the application through the same public HTTPS gateway.
-   - **Remote Employees / Admins:** Connect through an encrypted WireGuard VPN tunnel on UDP port 51820.
+1. **Traffic arrives:**
+   - **Public users** hit your domain on TCP 443 (HTTPS) from anywhere on the internet.
+   - **Office staff** go through the same public HTTPS gateway — no special routing for them.
+   - **Remote admins** connect through a WireGuard VPN tunnel on UDP 51820 before anything else.
 
-2. **Perimeter Edge Firewall / NAT Gateway (OPNsense / pfSense):**
-   - Enforces perimeter firewall policies and network address translation (NAT).
-   - Forwards only TCP port 443 and port 80 to the private server IP (`192.168.20.10`).
-   - Acts as the WireGuard VPN termination endpoint for authorized administrative access.
-   - Drops all unsolicited scans and probe attempts before they reach the server switchport.
+2. **Edge firewall (OPNsense / pfSense):**
+   - Enforces NAT and perimeter firewall rules.
+   - Forwards *only* TCP 443 and 80 to the server's private IP (`192.168.20.10`).
+   - Terminates WireGuard VPN connections for authorized admins.
+   - Silently drops all port scans and unsolicited probes before they ever reach the server.
 
-3. **Ingress & Reverse Proxy Layer (Nginx :443):**
-   - Terminates TLS 1.3 encryption using modern cryptographic ciphers.
-   - Applies dynamic rate limiting and validates HTTP request headers.
-   - Proxies validated requests directly to the application service via internal loopback (`127.0.0.1:3000`).
+3. **Nginx reverse proxy (port 443):**
+   - Terminates TLS 1.3 with modern ciphers.
+   - Applies rate limiting and validates HTTP headers.
+   - Passes clean requests downstream to the app on `127.0.0.1:3000`.
 
-4. **Application Service Tier (Backend Runtime):**
-   - Runs under a dedicated, unprivileged system user (`appuser`) with no interactive login shell.
-   - Bounded by systemd cgroups (`MemoryMax` and `CPUQuota`) to prevent memory leaks from impacting the host.
-   - Processes business logic and communicates with the database strictly over loopback (`127.0.0.1:<port>`).
+4. **Application service:**
+   - Runs as an unprivileged `appuser` with no login shell.
+   - systemd cgroups cap its memory (`MemoryMax`) and CPU, so a misbehaving app can't starve the database.
+   - Talks to the database only over loopback (`127.0.0.1:<port>`).
 
-5. **Persistence Engine Tier (Database Engine):**
-   - Bound strictly to the localhost loopback interface (`127.0.0.1`); rejects all external physical network connections.
-   - Authenticates application connections using salted cryptographic password hashes.
-   - Stores all data files in `/data/db` with exclusive directory permissions (`0700`, accessible only by the database service).
+5. **Database engine:**
+   - Binds exclusively to `127.0.0.1` — it won't accept connections from the physical network.
+   - Authenticates the app using salted cryptographic hashes.
+   - Keeps all data files under `/data/db` with strict `0700` permissions.
 
-6. **Storage Subsystem & Off-Site Data Pipeline:**
-   - Operates on a high-speed enterprise NVMe RAID 10 storage array divided into `/data/db`, `/data/app`, and `/data/backups`.
-   - Executes daily automated encrypted backups that are pushed off-site to AWS S3/Wasabi with Object Lock enabled for ransomware defense.
+6. **Storage & off-site backup:**
+   - NVMe RAID 10 is split into `/data/db`, `/data/app`, and `/data/backups`.
+   - Daily encrypted backups are pushed off-site to AWS S3 or Wasabi with Object Lock, so ransomware can't touch them.
 
 ---
 
-## 3. Zero-Trust Access Model: Public, Office LAN & Remote VPN
+## 3. Zero-Trust Access: Public Users, Office Staff & Remote Admins
 
-Every incoming request is verified and authenticated regardless of network origin. Physical presence on the corporate network grants zero implicit trust or access to the server.
+Every connection is verified, no matter where it comes from. Being physically inside the office building gives you exactly zero extra access to the server.
 
 ![Zero-Trust Access Model](assets/02-zero-trust-access-model.jpg)
 
-### User Access Profiles & Routing Paths
+### Who Can Access What
 
-1. **Profile 1: Public Customers (Global Internet):**
-   - Resolves the application domain via Anycast DNS and connects over public HTTPS (TCP 443).
-   - Traffic enters through the edge gateway, is NAT-forwarded to Nginx, and proxies internally to the backend application.
+1. **Public customers (internet):**
+   - Resolve your domain via DNS and connect over HTTPS (TCP 443).
+   - Traffic flows through the edge gateway → Nginx → backend app. That's it.
 
-2. **Profile 2: Office Employees (Corporate LAN - VLAN 10):**
-   - Employee workstations, laptops, and Wi-Fi devices reside in an isolated subnet (VLAN 10: `192.168.10.0/24`).
-   - **Layer-3 Access Rule:** All direct IP traffic from VLAN 10 to the Production Server VLAN 20 (`192.168.20.10`) is **STRICTLY BLOCKED** at the router switchport.
-   - Employees access business applications through the public HTTPS domain like external customers, authenticating through application identity providers.
-   - Physical presence on the office network provides zero access to internal databases, administrative shells, or server management ports.
+2. **Office employees (VLAN 10 — `192.168.10.0/24`):**
+   - All workstations, laptops, and Wi-Fi devices live on an isolated VLAN.
+   - **Direct IP access from VLAN 10 to the production server (VLAN 20) is hard-blocked at the router.** No exceptions.
+   - Office employees access the app the same way external customers do: via the public HTTPS domain.
+   - Being in the office gives zero access to internal databases, SSH, or any management ports.
 
-3. **Profile 3: Remote System Administrators (WireGuard VPN):**
-   - Systems engineers establish an encrypted WireGuard VPN tunnel on UDP port 51820.
-   - Connections authenticate using pre-configured, non-exportable Ed25519 cryptographic public keys.
-   - Once the tunnel is verified, the administrator receives an internal VPN IP (`10.20.0.0/24`).
-   - Only from this VPN subnet is SSH access (TCP 22) permitted by the server's firewall. Direct root login is disabled, and administrative commands require audited `sudo` elevation.
+3. **Remote system administrators (WireGuard VPN):**
+   - Admins establish an encrypted WireGuard tunnel on UDP 51820.
+   - Authentication is done with pre-configured Ed25519 public keys — no passwords.
+   - Once connected, the admin gets an internal VPN IP in the `10.20.0.0/24` range.
+   - SSH (TCP 22) is only allowed from that VPN subnet. Root login is disabled; `sudo` is required and fully audited.
 
-### Host-Level Firewall (UFW) Security Policy
+### Host Firewall Rules (UFW)
 
-The physical server runs an autonomous host-level firewall (UFW / Netfilter) enforcing strict stateful packet filtering:
-
-| Port / Protocol | Allowed Source Interface | Direction | Firewall Action | Architectural Guarantee |
+| Port / Protocol | Allowed From | Direction | Action | Why |
 |---|---|---|---|---|
-| **TCP 443 (HTTPS)** | Any (`0.0.0.0/0`) | Inbound | **ACCEPT** | Passes public web traffic directly to Nginx reverse proxy. |
-| **TCP 80 (HTTP)** | Any (`0.0.0.0/0`) | Inbound | **ACCEPT** | Passes traffic to Nginx for immediate 301 redirect to HTTPS. |
-| **TCP 22 (SSH)** | VPN Subnet (`10.20.0.0/24`) ONLY | Inbound | **ACCEPT** | Administrative shell access permitted exclusively over WireGuard VPN. |
-| **Application Port (3000)** | Loopback (`127.0.0.1`) ONLY | Inbound | **DROP on Physical NICs** | Inaccessible from external cables; accepts packets only from Nginx. |
-| **Database Port (5432/27017)**| Loopback (`127.0.0.1`) ONLY | Inbound | **DROP on Physical NICs** | Inaccessible from external cables; accepts packets only from App. |
-| **All Other Ports** | Any | Inbound | **DEFAULT DROP** | Silent packet drop with zero ICMP feedback to port scanners. |
+| **TCP 443 (HTTPS)** | Anywhere (`0.0.0.0/0`) | Inbound | **ACCEPT** | Public web traffic goes to Nginx. |
+| **TCP 80 (HTTP)** | Anywhere (`0.0.0.0/0`) | Inbound | **ACCEPT** | Nginx catches this and 301-redirects to HTTPS. |
+| **TCP 22 (SSH)** | VPN only (`10.20.0.0/24`) | Inbound | **ACCEPT** | Admin access only over WireGuard. |
+| **App Port (3000)** | Loopback only (`127.0.0.1`) | Inbound | **DROP on NICs** | Only Nginx can reach it — invisible to the outside world. |
+| **DB Port (5432/27017)** | Loopback only (`127.0.0.1`) | Inbound | **DROP on NICs** | Only the app can reach the database. |
+| **Everything else** | Anywhere | Inbound | **DEFAULT DROP** | Silent drop — port scanners get no feedback. |
 
 ---
 
-## 4. Ingress Traffic & Reverse Proxy Architecture
+## 4. Nginx: The Public-Facing Shield
 
-Nginx serves as the single public-facing software component on the physical server, shielding internal services from raw network traffic:
+Nginx is the only process on this server that ever touches raw internet traffic. Everything else hides safely behind it:
 
 ```
 [ Inbound Request ] ──► [ Nginx 1.26 LTS ] ──► [ Localhost Proxy ] ──► [ Application Service ]
@@ -142,71 +142,69 @@ Nginx serves as the single public-facing software component on the physical serv
                       • Client Request Buffering
 ```
 
-- **TLS Offloading:** Nginx terminates TLS 1.3 handshakes using hardware-accelerated elliptic-curve cryptography, freeing application worker threads from CPU-intensive cryptographic processing.
-- **Header Hardening:** Injects mandatory HTTP security headers (`Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy`) to neutralize Cross-Site Scripting (XSS), Clickjacking, and MIME-sniffing exploits.
-- **Abuse Prevention & Rate Limiting:** Enforces memory-backed leaky-bucket rate limiting zones:
-  - *Authentication Endpoints:* Capped at 5 requests/minute per IP to prevent credential-stuffing and brute-force attacks.
-  - *General API Routes:* Capped at 30 requests/second per IP to prevent denial-of-service scraping.
-- **Slowloris & Buffer Shielding:** Nginx buffers slow, streaming client uploads completely in memory/disk before passing the request to the backend service, preventing slow-client connection exhaustion.
+- **TLS offloading:** Nginx handles the TLS 1.3 handshake using hardware-accelerated elliptic-curve cryptography, so your application workers don't burn CPU on crypto.
+- **Security headers:** Every response gets `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Content-Security-Policy` injected automatically — mitigating XSS, clickjacking, and MIME-sniffing attacks.
+- **Rate limiting:**
+  - *Auth endpoints* — max 5 requests/minute per IP to stop credential-stuffing and brute-force attacks.
+  - *General API routes* — max 30 requests/second per IP to prevent scraping and denial-of-service.
+- **Slowloris protection:** Nginx buffers slow client uploads completely before handing them to the backend, so a slow connection can't exhaust your app's thread pool.
 
 ---
 
-## 5. Hardware Sizing & Resource Allocation Model
+## 5. Hardware Sizing & Resource Allocation
 
-Because compute, memory, and storage buses are shared between the application service and the database engine, resources are statically partitioned to prevent starvation:
+Since the app and database share the same CPU, RAM, and storage bus, resources are carved up statically so neither service can starve the other:
 
 ![Hardware Sizing & Resource Allocation](assets/03-hardware-and-resource-allocation.jpg)
 
-### Resource Partitioning Breakdown
+### How the Resources Are Divided
 
-1. **CPU Core Pinning (16 Physical Cores):**
-   - **Cores 0–3 (4 Cores):** Dedicated to the Linux Kernel, network interface interrupts, system daemons, and Nginx ingress processing.
-   - **Cores 4–9 (6 Cores):** Dedicated to the Application Service runtime, handling business logic, worker threads, and garbage collection.
-   - **Cores 10–15 (6 Cores):** Dedicated to the Database Engine, running query planner workers, background write threads, and transaction commit flushing.
+1. **CPU (16 Physical Cores):**
+   - **Cores 0–3 (4 cores):** Kernel, network interrupt handling, system daemons, and Nginx.
+   - **Cores 4–9 (6 cores):** Application service — business logic, worker threads, garbage collection.
+   - **Cores 10–15 (6 cores):** Database engine — query planning, background writes, transaction commits.
 
-2. **Memory Allocation (64 GB ECC RAM Budget):**
-   - **32 GB (50%):** Dedicated to Database Shared Buffers, index caching, and query execution working memory.
-   - **16 GB (25%):** Allocated to Application Service heap space, strictly capped by systemd cgroups (`MemoryMax=16G`).
-   - **10 GB (16%):** Allocated to Linux Virtual Filesystem (VFS) page cache to accelerate repeated file and database reads.
-   - **6 GB (9%):** Reserved for OS kernel overhead, telemetry daemons, and security tools.
+2. **RAM (64 GB ECC):**
+   - **32 GB (50%):** Database shared buffers, index caching, and query working memory.
+   - **16 GB (25%):** Application heap, hard-capped via systemd cgroups (`MemoryMax=16G`).
+   - **10 GB (16%):** Linux VFS page cache to speed up repeated file and database reads.
+   - **6 GB (9%):** OS kernel, telemetry agents, and security tools.
 
-3. **Storage Subsystem:**
-   - Four enterprise NVMe SSDs arranged in RAID 10 (Striped Mirrors), delivering high random-write IOPS and monitored continuously via SMART health telemetry.
+3. **Storage:**
+   - Four enterprise NVMe SSDs in RAID 10 — high IOPS, two-drive failure tolerance, monitored via SMART.
 
-4. **Physical Chassis & Thermal Cooling:**
-   - Rack-mounted 1U/2U server chassis with front-to-back airflow, redundant cooling fans, and IPMI hardware monitoring.
+4. **Chassis & Cooling:**
+   - 1U/2U rack-mount with front-to-back airflow, redundant cooling fans, and IPMI hardware monitoring.
 
-5. **Power Resilience & Dual-Rail UPS:**
-   - Dual hot-swap power supply units (PSU 1 & PSU 2) connected to independent power circuits (Feed A and Feed B).
-   - Backed by an intelligent on-line Uninterruptible Power Supply (UPS) providing 5+ minutes of battery runtime.
-   - An integrated daemon (`nut` / `apcupsd`) initiates an automated flush of in-memory database buffers and a safe system shutdown if utility power remains unrecovered.
+5. **Power Resilience:**
+   - Dual hot-swap PSUs on independent power circuits (Feed A and Feed B).
+   - Backed by an intelligent on-line UPS providing 5+ minutes of battery runtime.
+   - `nut` / `apcupsd` monitors the UPS and triggers an automatic safe shutdown if power doesn't recover in time.
 
 ---
 
-## 6. Storage Architecture & Partition Isolation
+## 6. Storage Layout & Partition Isolation
 
-Persistence relies on four enterprise NVMe SSDs configured in **RAID 10**, combining striping throughput with mirror redundancy:
+The four NVMe SSDs are configured in **RAID 10** — you get the write speed of striping and the redundancy of mirroring at the same time:
 
 ![Storage Architecture RAID 10 & Partitioning](assets/04-storage-raid10-partitioning.jpg)
 
-### Storage Assembly & Partitioning Workflow
+### How It's Built
 
-1. **Physical NVMe Drives:** 4 identical enterprise PCIe NVMe SSDs (e.g., 1 TB each).
-2. **Mirrored Pairs (RAID 1):** Drive 1 and Drive 2 form Mirror Pair 1; Drive 3 and Drive 4 form Mirror Pair 2. Each pair provides complete data mirroring.
-3. **Striping (RAID 0 $ightarrow$ RAID 10):** The two mirrored pairs are striped together, creating a unified high-speed 2 TB usable storage volume with zero parity write penalties and multi-drive failure tolerance.
-4. **Partition Allocation:**
-   - `/data/db` (~1 TB / 50%): Dedicated to database tables, indexes, and write-ahead transaction journals (WAL). Mounted with `noatime` and restricted to `chmod 0700`.
-   - `/data/app` (~600 GB / 30%): Dedicated to application releases, user-uploaded assets, and runtime logs. Storage quotas prevent application logs from consuming database disk space.
-   - `/data/backups` (~400 GB / 20%): Local staging area for daily database snapshot creation and encryption prior to off-site cloud synchronization.
-
-5. **Performance Mount Options:**
-   - All data filesystems are mounted with `noatime`, disabling write overhead for file access timestamp updates on read operations and boosting database I/O performance.
+1. **Four identical enterprise PCIe NVMe SSDs** (e.g., 1 TB each).
+2. **Mirror pairs:** Drives 1+2 form Mirror Pair 1; Drives 3+4 form Mirror Pair 2. Each pair is a complete mirror.
+3. **Stripe:** The two mirror pairs are striped together into one unified ~2 TB volume — zero parity penalty, full redundancy.
+4. **Partitions:**
+   - `/data/db` (~1 TB / 50%) — database tables, indexes, and WAL journals. Mounted with `noatime`, permissions `chmod 0700`.
+   - `/data/app` (~600 GB / 30%) — application releases, user uploads, and logs. Quotas prevent logs from eating database disk space.
+   - `/data/backups` (~400 GB / 20%) — staging area for encrypted daily snapshots before they're pushed off-site.
+5. **Performance tuning:** All data partitions are mounted with `noatime`, eliminating unnecessary write overhead on every file read.
 
 ---
 
-## 7. Operating System Hardening & Process Sandboxing
+## 7. OS Hardening & Process Sandboxing
 
-The OS baseline is minimized: compilers (`gcc`, `make`), package build tools, and unnecessary network daemons are barred from the production server.
+The production server runs a lean OS — no compilers (`gcc`, `make`), no build tools, no unnecessary daemons. If it doesn't need to be there, it isn't.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -226,53 +224,54 @@ The OS baseline is minimized: compilers (`gcc`, `make`), package build tools, an
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Process Isolation via Systemd:** The application service executes under an unprivileged `appuser`. Systemd enforces `MemoryMax=16G` (preventing memory leaks from causing host OOM crashes), `ProtectSystem=strict` (mounting system binaries read-only), and `PrivateTmp=true` (isolating `/tmp`).
-- **Kernel Parameter Hardening (Sysctl):** Enforces strict reverse path filtering (`rp_filter = 1`) to defeat IP spoofing, activates TCP SYN cookies (`tcp_syncookies = 1`) to neutralize SYN floods, and disables ICMP redirects.
-- **Audit Subsystem (`auditd`):** Hooks into kernel system calls to maintain an immutable audit trail of modifications to sensitive files (`/etc/shadow`, `/etc/ssh/sshd_config`, and application secrets).
+- **systemd sandboxing:** The app runs as `appuser` with no shell access. systemd enforces `MemoryMax=16G` (a memory leak won't crash the host), `ProtectSystem=strict` (system binaries are mounted read-only), and `PrivateTmp=true` (gives the service its own isolated `/tmp`).
+- **Kernel hardening (sysctl):** Enables strict reverse-path filtering (`rp_filter=1`) to block IP spoofing, activates SYN cookies (`tcp_syncookies=1`) to absorb SYN floods, and disables ICMP redirects.
+- **Audit trail (`auditd`):** Hooks into kernel syscalls to keep an immutable log of any changes to sensitive files like `/etc/shadow`, `/etc/ssh/sshd_config`, and application secrets.
 
 ---
 
-## 8. Application Lifecycle & Zero-Downtime Deployment
+## 8. Deployments & Zero-Downtime Releases
 
-Software deployments use an **Atomic Symlink Strategy** with pre-compiled artifacts built off-host in Continuous Integration:
+Releases use an **Atomic Symlink Strategy**. Artifacts are built off-server in CI — no compilers, npm, or pip ever run in production.
 
 ![Application Lifecycle & Zero-Downtime Deployment](assets/05-application-deployment-lifecycle.jpg)
 
-### Five-Stage Deployment Workflow
+### The Five-Step Deployment Flow
 
-1. **Stage 1 (Build Artifact in CI):** Application code is built, tested, and packaged into a production artifact (e.g., zip/tarball) on an external CI runner. No compilers or package managers run on the production server.
-2. **Stage 2 (Copy & Extract):** The pre-compiled artifact is copied to the server and extracted into a new timestamped directory under `/data/app/releases/<timestamp>/`.
-3. **Stage 3 (Link Shared Resources):** Shared configuration secrets (`.env`, stored in `/data/app/shared/` with mode `640`) and persistent customer uploads are symlinked into the new release directory.
-4. **Stage 4 (Validate Release):** The application is health-checked on an ephemeral local port (e.g., 3001) to verify database connectivity and dependency health prior to routing live traffic.
-5. **Stage 5 (Atomic Switch):** If validation passes, the `current` symbolic link is atomically repointed to the new release directory using `ln -sfn`. Nginx continues serving incoming requests with zero downtime.
+1. **Build in CI:** Code is compiled, tested, and packaged into a production artifact (zip/tarball) on an external CI runner. The production server stays clean.
+2. **Copy & extract:** The artifact is copied to the server and unpacked into a new timestamped directory under `/data/app/releases/<timestamp>/`.
+3. **Link shared resources:** Secrets (`.env` in `/data/app/shared/`, mode `640`) and persistent user uploads are symlinked into the new release folder.
+4. **Health check:** The app is started on a temporary local port (e.g., 3001) and checked for database connectivity and dependency health before any live traffic hits it.
+5. **Atomic switch:** If the health check passes, the `current` symlink is atomically pointed at the new release with `ln -sfn`. Nginx keeps serving traffic with zero downtime.
 
-### Instant Rollback Capability
-If a critical error is detected post-deployment, the `current` symlink is repointed back to the previous stable release directory in a single command. The application reverts to the known-good version in seconds without re-downloading or re-building code.
+### Instant Rollback
+
+If something goes wrong after a deploy, repoint the `current` symlink back to the previous release directory. The app is back on the known-good version in seconds — no re-downloading, no rebuilding.
 
 ---
 
-## 9. Inter-Tier Communication & Data Isolation
+## 9. How the App and Database Talk to Each Other
 
-The application service and database engine communicate strictly over internal system boundaries:
+These two services communicate entirely inside the machine:
 
 ```
 [ Nginx Reverse Proxy ]
           │
-          ▼ (Unix Domain Socket / Localhost HTTP - Sub-10 microsecond latency)
+          ▼ (Unix Domain Socket / Localhost HTTP — sub-10 microsecond latency)
 [ Application Service ]
           │
-          ▼ (Loopback TCP: 127.0.0.1 - Sub-millisecond query execution)
+          ▼ (Loopback TCP: 127.0.0.1 — sub-millisecond query execution)
 [ Database Engine ]
 ```
 
-- **Loopback Binding:** The database engine binds strictly to `127.0.0.1`. Remote TCP connections are rejected at the socket layer.
-- **Privilege Scoping:** The application connects using a non-administrative database user with credentials stored in an out-of-tree `.env` file (mode 640). The application role holds standard Data Manipulation Language (DML) rights but cannot execute destructive schema drops (`DROP TABLE`, `ALTER SYSTEM`).
+- **Loopback-only binding:** The database only listens on `127.0.0.1`. Any connection attempt from the physical network is rejected at the socket layer.
+- **Least-privilege database user:** The app connects with a non-admin database account. Credentials live in an out-of-tree `.env` file (mode `640`). The account can read and write data (DML), but it cannot drop tables or alter the system (`DROP TABLE`, `ALTER SYSTEM` are off-limits).
 
 ---
 
-## 10. Observability & Centralized Telemetry Pipeline
+## 10. Observability & Monitoring
 
-Telemetry collection runs out-of-band: local lightweight collectors gather metrics and stream logs to a dedicated external observability cluster:
+Telemetry collection is out-of-band — lightweight local agents gather data and ship it to a separate external monitoring cluster, so observability doesn't interfere with the production workload:
 
 ```
 [ Production Server ]
@@ -280,14 +279,14 @@ Telemetry collection runs out-of-band: local lightweight collectors gather metri
   • Promtail        ──(TLS log streaming)────────►  [ Central Grafana Loki ]
 ```
 
-- **Proactive Alerting:** Out-of-band alerts notify on-call engineers via Slack or PagerDuty if disk utilization exceeds 80%, RAM exceeds 85%, or HTTP 5xx error rates exceed 1%.
-- **Immutable Log Storage:** Promtail streams logs in real time to external Write-Once-Read-Many (WORM) storage, ensuring audit records remain preserved even if the host is compromised.
+- **Proactive alerting:** On-call engineers get notified via Slack or PagerDuty when disk hits 80%, RAM hits 85%, or HTTP 5xx error rates exceed 1%.
+- **Immutable log storage:** Promtail streams logs in real time to external WORM storage. Even if the host is fully compromised, the audit records stay intact.
 
 ---
 
-## 11. Backup Strategy & Disaster Recovery Architecture
+## 11. Backup Strategy & Disaster Recovery
 
-Data durability follows the **3-2-1 Backup Strategy**:
+Data durability follows the **3-2-1 rule** — three copies, two media types, one off-site:
 
 ```
 [ 1. Live Data ]             Database files on NVMe RAID 10
@@ -299,29 +298,31 @@ Data durability follows the **3-2-1 Backup Strategy**:
 [ 3. Off-Site Storage ]      AWS S3 / Wasabi with Object Lock (WORM Immutability)
 ```
 
-- **RPO (Recovery Point Objective):** `< 5 Minutes` via continuous database transaction write-log streaming.
-- **RTO (Recovery Time Objective):** `< 4 Hours` for complete bare-metal or virtual standby provisioning, snapshot rehydration, and DNS record swing.
-- **Ransomware Defense:** Off-site storage enforces Object Lock in Compliance Mode. Backup archives cannot be deleted or overwritten by host administrative credentials.
+- **RPO (Recovery Point Objective): < 5 minutes** — continuous transaction log streaming keeps data loss minimal.
+- **RTO (Recovery Time Objective): < 4 hours** — full bare-metal or virtual standby provisioning, snapshot rehydration, and DNS cutover.
+- **Ransomware immunity:** Off-site storage uses Object Lock in Compliance Mode. Backup archives cannot be deleted or overwritten — not even by host admin credentials.
 
 ---
 
-## 12. Architectural Limitations & Strategic Solutions
+## 12. Known Limitations & How to Handle Them
 
-| Architectural Limitation | Technical Impact | Architectural Solution |
+Every architecture has trade-offs. Here's what to watch for with this design:
+
+| Limitation | Impact | Mitigation |
 |---|---|---|
-| **Single Point of Failure (SPOF)** | Motherboard or CPU failure halts execution until hardware is repaired. | Maintain a standby host receiving continuous database transaction log replication. Repoint DNS (TTL 300s) to the standby within 15–30 minutes during a major hardware failure. |
-| **Hardware Scaling Ceiling** | Single-node vertical scaling is bounded by motherboard socket and RAM capacity. | Decouple read traffic via a secondary read replica, or migrate the database to its own dedicated bare-metal server while maintaining this host for the application service. |
-| **Shared Resource Competition** | Heavy database batch jobs compete with the application runtime for CPU and I/O. | Enforce systemd cgroup bounds (`CPUQuota`, `MemoryMax`) on the app, configure database query timeouts (`statement_timeout = 30s`), and route analytics off-host. |
-| **Single Machine Blast Radius** | Root compromise exposes both application files and local database storage. | Enforce unprivileged user execution, lock file permissions (`0700` for DB, `640` for secrets), encrypt sensitive database fields in the application, and isolate backups off-site. |
-| **Reboot Downtime for Kernel Patches** | Kernel security updates require a system reboot. | Deploy Linux live-patching (`kpatch` / Canonical Livepatch) for in-memory updates. Schedule mandatory physical maintenance during designated low-traffic hours. |
-| **DDoS Vulnerability** | Direct volumetric packet floods can saturate the physical edge link. | Place an upstream Anycast CDN / reverse proxy (such as Cloudflare) in front of the domain to absorb volumetric DDoS attacks before they reach the edge router. |
+| **Single Point of Failure (SPOF)** | A motherboard or CPU failure takes everything down until hardware is replaced. | Keep a standby host receiving continuous DB transaction log replication. Repoint DNS (TTL 300s) to the standby within 15–30 minutes during a major failure. |
+| **Vertical Scaling Ceiling** | You can only add so much RAM and CPU to one machine. | Add a secondary read replica for read-heavy workloads, or move the database to its own dedicated server as you grow. |
+| **Shared Resource Contention** | Heavy database batch jobs can compete with the app for CPU and I/O. | systemd cgroup limits (`CPUQuota`, `MemoryMax`) on the app, database query timeouts (`statement_timeout=30s`), and route analytics queries off-host. |
+| **Blast Radius on Compromise** | A root compromise could expose both app files and the local database. | Unprivileged execution, strict file permissions (`0700` for DB, `640` for secrets), application-layer encryption of sensitive fields, and off-site isolated backups. |
+| **Reboot Downtime for Kernel Patches** | Kernel security updates require a reboot. | Use Linux live-patching (`kpatch` / Canonical Livepatch) for in-memory kernel updates. Schedule mandatory reboots during low-traffic windows. |
+| **DDoS Vulnerability** | A volumetric packet flood can saturate the edge link before your firewall can do anything. | Put an Anycast CDN (like Cloudflare) in front of your domain to absorb volumetric attacks before they reach your router. |
 
 ---
 
-## 13. Operational Guarantees
+## 13. What This Architecture Guarantees
 
-- **Sub-Millisecond Inter-Tier Performance:** Direct in-memory loopback communication between application and persistence tiers.
-- **Language & Database Independence:** Identical architectural guarantees across any backend runtime or database technology.
-- **Zero-Trust Access Control:** Total isolation between Public Internet, Corporate Office LAN, and Administrative WireGuard VPN.
-- **Hardware Fault Tolerance:** RAID 10 storage redundancy and dual-rail UPS battery protection.
-- **Deterministic Business Continuity:** Continuous transaction log archiving with `< 5 min` RPO and `< 4 hr` RTO.
+- **Sub-millisecond inter-tier latency** — the app and database talk in memory, not over a network.
+- **Language and database agnostic** — swap out the runtime or database engine without changing the architecture.
+- **Zero-trust access control** — internet, office LAN, and admin VPN are strictly separated with no implicit trust.
+- **Hardware fault tolerance** — RAID 10 storage redundancy and dual-rail UPS battery protection.
+- **Predictable recovery** — continuous transaction log archiving with < 5 min RPO and < 4 hr RTO.
